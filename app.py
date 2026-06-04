@@ -1,37 +1,38 @@
 """
 app.py
 -------------------------------------------------------------------
-Asistente RAG de Contrataciones Publicas — interfaz tipo NotebookLM
-("Fuentes Seleccionables").
+Asistente RAG de Contrataciones Publicas — "Repositorio de Casos"
+(experiencia tipo NotebookLM con persistencia local).
 
-Layout dividido:
-  - Panel izquierdo (30%): gestion de "Fuentes del Caso" (subir documentos
-    con OCR + etiquetas; cada fuente tiene un interruptor on/off).
-  - Panel derecho (70%): chat y resultados del analisis.
+Flujo:
+  - Repositorio de Casos: el usuario ve sus casos guardados y puede crear
+    uno nuevo. Al entrar a un caso, gestiona SUS fuentes y chatea con ellas.
+  - Aislamiento: cada caso tiene sus propias fuentes y su propio chat.
+    Un caso nunca mezcla documentos con otro (todo se filtra por caso_id).
 
-Logica de inyeccion de contexto:
-  - Las fuentes subidas se guardan en el servidor con un id.
-  - En cada turno, el frontend envia SOLO los ids de las fuentes ENCENDIDAS.
-  - El backend concatena unicamente esos textos como contexto, cruzandolos
-    con la base vectorial (BigQuery VECTOR_SEARCH). Las fuentes apagadas se
-    ignoran en ese turno.
+Persistencia: SQLite nativo (casos.db), dos tablas: casos y fuentes.
+
+Subida de fuentes: asincrona con estado (procesando -> listo/error),
+con extraccion de texto y FALLBACK de OCR (Cloud Vision) para escaneos.
+
+Memoria multi-turno: el historial se inyecta con roles nativos user/model.
 
 Endpoints:
-  GET    /                 -> interfaz web (NotebookLM-like).
-  POST   /api/fuentes      -> multipart {archivo, etiquetas} -> registra fuente.
-  GET    /api/fuentes      -> lista las fuentes del caso.
-  DELETE /api/fuentes/{id} -> elimina una fuente.
-  POST   /api/chat         -> {pregunta, fuentes_activas[], modo, k} -> respuesta.
-  GET    /salud            -> healthcheck.
-
-Nota: el estado de fuentes vive EN MEMORIA del proceso (suficiente para un
-servidor uvicorn unico). Para Cloud Run multi-instancia conviene moverlo a
-Firestore/Redis.
+  GET    /                                  -> interfaz web.
+  GET    /api/casos                         -> lista de casos.
+  POST   /api/casos                         -> crea un caso {nombre}.
+  DELETE /api/casos/{cid}                   -> elimina un caso (y sus fuentes).
+  GET    /api/casos/{cid}/fuentes           -> fuentes del caso.
+  POST   /api/casos/{cid}/fuentes           -> sube una fuente (async + OCR).
+  GET    /api/casos/{cid}/fuentes/{fid}     -> estado de una fuente (polling).
+  DELETE /api/casos/{cid}/fuentes/{fid}     -> elimina una fuente.
+  POST   /api/chat                          -> chat/analisis dentro de un caso.
+  GET    /salud                             -> healthcheck.
 
 Requisitos:
     pip install fastapi "uvicorn[standard]" python-multipart google-cloud-bigquery \
                 google-genai pypdf python-docx pymupdf google-cloud-vision
-    Autenticacion ADC + tabla creada con indexar_bigquery.py + Vision API.
+    Autenticacion ADC + tabla BigQuery + Vision API.
 
 Ejecutar en local:
     python -m uvicorn app:app --host 0.0.0.0 --port 8080
@@ -39,6 +40,11 @@ Ejecutar en local:
 """
 
 import uuid
+import json
+import sqlite3
+import threading
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -47,38 +53,220 @@ from google.genai.types import GenerateContentConfig, Content, Part
 
 # Motor RAG ya implementado y probado.
 from responder import recuperar, construir_contexto, cliente, MODELO_GEN
-# Extraccion de texto reutilizada (en memoria) con FALLBACK de OCR (Cloud Vision).
+# Extraccion de texto (en memoria) con FALLBACK de OCR (Cloud Vision).
 from extraccion_texto import extraer_pdf_inteligente, extraer_docx
 
-app = FastAPI(title="Asistente RAG - Contrataciones Publicas (NotebookLM)")
+app = FastAPI(title="Asistente RAG - Repositorio de Casos")
 
-# Estado de las "Fuentes del Caso" (en memoria del proceso).
-#   id -> {id, nombre, etiquetas[], texto, n_chars, metodo}
-FUENTES = {}
+# ===================== CONFIGURACION =====================
+DB_PATH = "casos.db"
+_db_lock = threading.Lock()
 
-# Limite total de texto de fuentes activas que se envia al LLM (control de costo).
-MAX_CONTEXT_CHARS = 200_000
-# Caracteres de las fuentes usados para construir la consulta de recuperacion.
-QUERY_DOC_CHARS = 3_000
+MAX_CONTEXT_CHARS = 200_000        # tope de texto de fuentes activas enviado al LLM
+QUERY_DOC_CHARS = 3_000            # extracto para construir la consulta de recuperacion
+MAX_TURNOS_HISTORIAL = 12          # turnos de historial inyectados al modelo
+# ========================================================
+
+
+# ============================ BASE DE DATOS (SQLite) ============================
+def _conn():
+    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def _ahora():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _init_db():
+    con = _conn()
+    try:
+        con.execute("PRAGMA journal_mode = WAL")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS casos (
+                id             TEXT PRIMARY KEY,
+                nombre         TEXT NOT NULL,
+                fecha_creacion TEXT NOT NULL
+            )""")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS fuentes (
+                id             TEXT PRIMARY KEY,
+                caso_id        TEXT NOT NULL,
+                nombre         TEXT NOT NULL,
+                etiquetas      TEXT,                 -- JSON array
+                texto          TEXT,
+                n_chars        INTEGER DEFAULT 0,
+                metodo         TEXT,
+                estado         TEXT NOT NULL,         -- procesando | listo | error
+                error          TEXT,
+                fecha_creacion TEXT NOT NULL,
+                FOREIGN KEY (caso_id) REFERENCES casos(id) ON DELETE CASCADE
+            )""")
+        con.commit()
+    finally:
+        con.close()
+
+
+# --- Casos ---
+def crear_caso(nombre):
+    cid = uuid.uuid4().hex[:12]
+    ts = _ahora()
+    with _db_lock:
+        con = _conn()
+        try:
+            con.execute("INSERT INTO casos (id, nombre, fecha_creacion) VALUES (?,?,?)",
+                        (cid, nombre, ts))
+            con.commit()
+        finally:
+            con.close()
+    return {"id": cid, "nombre": nombre, "fecha_creacion": ts, "n_fuentes": 0}
+
+
+def listar_casos():
+    con = _conn()
+    try:
+        rows = con.execute("""
+            SELECT c.id, c.nombre, c.fecha_creacion, COUNT(f.id) AS n_fuentes
+            FROM casos c LEFT JOIN fuentes f ON f.caso_id = c.id
+            GROUP BY c.id ORDER BY c.fecha_creacion DESC
+        """).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def caso_existe(cid):
+    con = _conn()
+    try:
+        return con.execute("SELECT 1 FROM casos WHERE id=?", (cid,)).fetchone() is not None
+    finally:
+        con.close()
+
+
+def borrar_caso(cid):
+    with _db_lock:
+        con = _conn()
+        try:
+            con.execute("DELETE FROM fuentes WHERE caso_id=?", (cid,))  # explicito (ademas del cascade)
+            con.execute("DELETE FROM casos WHERE id=?", (cid,))
+            con.commit()
+        finally:
+            con.close()
+
+
+# --- Fuentes ---
+def crear_fuente_registro(caso_id, nombre, etiquetas_list):
+    fid = uuid.uuid4().hex[:12]
+    ts = _ahora()
+    with _db_lock:
+        con = _conn()
+        try:
+            con.execute("""INSERT INTO fuentes
+                (id, caso_id, nombre, etiquetas, texto, n_chars, metodo, estado, error, fecha_creacion)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (fid, caso_id, nombre, json.dumps(etiquetas_list, ensure_ascii=False),
+                 "", 0, None, "procesando", None, ts))
+            con.commit()
+        finally:
+            con.close()
+    return fid
+
+
+def actualizar_fuente(fid, **campos):
+    if not campos:
+        return
+    cols = ", ".join(f"{k}=?" for k in campos)          # claves internas, no input de usuario
+    vals = list(campos.values()) + [fid]
+    with _db_lock:
+        con = _conn()
+        try:
+            con.execute(f"UPDATE fuentes SET {cols} WHERE id=?", vals)
+            con.commit()
+        finally:
+            con.close()
+
+
+def _fila_publica(r):
+    return {
+        "id": r["id"], "caso_id": r["caso_id"], "nombre": r["nombre"],
+        "etiquetas": json.loads(r["etiquetas"] or "[]"),
+        "n_chars": r["n_chars"], "metodo": r["metodo"],
+        "estado": r["estado"], "error": r["error"],
+    }
+
+
+def obtener_fuente_publica(fid):
+    con = _conn()
+    try:
+        r = con.execute("SELECT * FROM fuentes WHERE id=?", (fid,)).fetchone()
+    finally:
+        con.close()
+    return _fila_publica(r) if r else None
+
+
+def listar_fuentes_publicas(caso_id):
+    con = _conn()
+    try:
+        rows = con.execute(
+            "SELECT * FROM fuentes WHERE caso_id=? ORDER BY fecha_creacion ASC", (caso_id,)).fetchall()
+    finally:
+        con.close()
+    return [_fila_publica(r) for r in rows]
+
+
+def fuentes_activas_texto(caso_id, ids):
+    """Devuelve (con texto) solo las fuentes del caso, en 'ids', y en estado 'listo'."""
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return []
+    marcas = ",".join("?" * len(ids))
+    con = _conn()
+    try:
+        rows = con.execute(
+            f"""SELECT * FROM fuentes
+                WHERE caso_id=? AND estado='listo' AND id IN ({marcas})""",
+            [caso_id] + ids).fetchall()
+    finally:
+        con.close()
+    return [{"id": r["id"], "nombre": r["nombre"],
+             "etiquetas": json.loads(r["etiquetas"] or "[]"), "texto": r["texto"]} for r in rows]
+
+
+def borrar_fuente(caso_id, fid):
+    with _db_lock:
+        con = _conn()
+        try:
+            con.execute("DELETE FROM fuentes WHERE id=? AND caso_id=?", (fid, caso_id))
+            con.commit()
+        finally:
+            con.close()
+
+
+_init_db()  # crea la base/tablas al cargar el modulo
+
+
+# ============================ MODELOS ============================
+class NuevoCaso(BaseModel):
+    nombre: str = ""
 
 
 class Turno(BaseModel):
-    rol: str = "user"           # "user" | "model"
+    rol: str = "user"
     texto: str = ""
 
 
 class Mensaje(BaseModel):
+    caso_id: str = ""
     pregunta: str = ""
     fuentes_activas: list[str] = []
-    modo: str = "chat"          # "chat" | "analisis"
+    modo: str = "chat"
     k: int = 5
-    historial: list[Turno] = []  # turnos previos (memoria multi-turno)
+    historial: list[Turno] = []
 
 
-# Maximo de turnos de historial que se inyectan al modelo (control de tokens/costo).
-MAX_TURNOS_HISTORIAL = 12
-
-
+# ============================ HELPERS RAG ============================
 def _doc_label(documento: str) -> str:
     return "Ley" if "ley-general" in documento else "Reglamento"
 
@@ -104,15 +292,29 @@ def _extraer_texto_temporal(nombre: str, data: bytes):
     raise ValueError("Formato no soportado. Solo se admiten .pdf o .docx.")
 
 
+def _procesar_fuente(fid, nombre, data):
+    """Worker en segundo plano: extrae texto (con OCR si aplica) y actualiza el estado en la BD."""
+    try:
+        texto, metodo = _extraer_texto_temporal(nombre, data)
+        if not texto or len(texto.strip()) < 20:
+            actualizar_fuente(fid, estado="error",
+                              error="No se pudo extraer texto del documento ni con OCR (vacio o danado).")
+            return
+        actualizar_fuente(fid, texto=texto, n_chars=len(texto), metodo=metodo, estado="listo", error=None)
+    except ValueError as e:
+        actualizar_fuente(fid, estado="error", error=str(e))
+    except Exception as e:
+        actualizar_fuente(fid, estado="error", error=f"{type(e).__name__}: {e}")
+
+
 def _sistema_chat():
     return (
-        "Eres un asistente experto en contrataciones publicas. Respondes consultas "
-        "de areas usuarias, especialistas y operadores. Reglas:\n"
-        "1. Usa como contexto los DOCUMENTOS DEL CASO (fuentes activas) y las NORMAS "
-        "RECUPERADAS del marco legal. No uses conocimiento externo.\n"
+        "Eres un asistente experto en contrataciones publicas. Respondes consultas de areas "
+        "usuarias, especialistas y operadores. Reglas:\n"
+        "1. Usa como contexto los DOCUMENTOS DEL CASO (fuentes activas) y las NORMAS RECUPERADAS "
+        "del marco legal. No uses conocimiento externo.\n"
         "2. Si la respuesta no esta en el contexto, dilo claramente: no inventes.\n"
-        "3. Cita SIEMPRE el respaldo: articulos de la norma (ej: Reglamento, Art. 304) "
-        "y/o el nombre de la fuente del caso.\n"
+        "3. Cita SIEMPRE el respaldo: articulos (ej: Reglamento, Art. 304) y/o la fuente del caso.\n"
         "4. Lenguaje claro y preciso; enumera plazos, montos o pasos cuando aplique."
     )
 
@@ -130,54 +332,47 @@ def _sistema_auditoria(etiquetas):
     )
 
 
-# ============================ SALUD ============================
+# ============================ ENDPOINTS ============================
 @app.get("/salud")
 def salud():
-    return {"status": "ok", "fuentes_en_memoria": len(FUENTES)}
+    return {"status": "ok", "casos": len(listar_casos())}
 
 
-# ====================== GESTION DE FUENTES =====================
-def _fuente_publica(f):
-    """Metadatos de una fuente (sin el texto completo)."""
-    return {
-        "id": f["id"], "nombre": f["nombre"], "etiquetas": f["etiquetas"],
-        "n_chars": f["n_chars"], "metodo": f["metodo"],
-        "estado": f["estado"], "error": f.get("error"),
-    }
+# ---- Casos ----
+@app.get("/api/casos")
+def api_listar_casos():
+    return listar_casos()
 
 
-def _procesar_fuente(fid, nombre, data):
-    """
-    Worker en SEGUNDO PLANO (threadpool): extrae el texto (con OCR si aplica)
-    y actualiza el estado de la fuente a 'listo' o 'error'. Para PDFs escaneados
-    grandes esto puede tardar, pero la subida ya respondio al usuario.
-    """
-    f = FUENTES.get(fid)
-    if f is None:
-        return  # la fuente fue eliminada antes de terminar
+@app.post("/api/casos")
+def api_crear_caso(c: NuevoCaso):
+    nombre = (c.nombre or "").strip() or "Caso sin nombre"
+    return JSONResponse(status_code=201, content=crear_caso(nombre))
+
+
+@app.delete("/api/casos/{cid}")
+def api_borrar_caso(cid: str):
+    borrar_caso(cid)
+    return {"ok": True}
+
+
+# ---- Fuentes (dentro de un caso) ----
+@app.get("/api/casos/{cid}/fuentes")
+def api_listar_fuentes(cid: str):
+    if not caso_existe(cid):
+        return JSONResponse(status_code=404, content={"error": "Caso no encontrado."})
+    return listar_fuentes_publicas(cid)
+
+
+@app.post("/api/casos/{cid}/fuentes")
+async def api_subir_fuente(cid: str, background_tasks: BackgroundTasks,
+                           archivo: UploadFile = File(...), etiquetas: str = Form("")):
     try:
-        texto, metodo = _extraer_texto_temporal(nombre, data)
-        if not texto or len(texto.strip()) < 20:
-            f.update(estado="error",
-                     error="No se pudo extraer texto del documento ni con OCR (archivo vacio o danado).")
-            return
-        f.update(texto=texto, n_chars=len(texto), metodo=metodo, estado="listo", error=None)
-    except ValueError as e:
-        f.update(estado="error", error=str(e))
-    except Exception as e:
-        f.update(estado="error", error=f"{type(e).__name__}: {e}")
+        if not caso_existe(cid):
+            return JSONResponse(status_code=404, content={"error": "Caso no encontrado."})
 
-
-@app.post("/api/fuentes")
-async def subir_fuente(background_tasks: BackgroundTasks,
-                       archivo: UploadFile = File(...), etiquetas: str = Form("")):
-    # SUBIDA ASINCRONA CON ESTADO: responde de inmediato con estado="procesando"
-    # y el OCR/extraccion (potencialmente lento) corre en segundo plano.
-    try:
-        # Etiquetas robustas: campo vacio, ausente o solo comas -> lista vacia.
         lista_etiquetas = [e.strip() for e in (etiquetas or "").split(",") if e.strip()]
 
-        # Validacion de formato temprana (para fallar rapido, antes de registrar).
         lower = (archivo.filename or "").lower()
         if not (lower.endswith(".pdf") or lower.endswith(".docx")):
             return JSONResponse(status_code=400, content={
@@ -187,59 +382,44 @@ async def subir_fuente(background_tasks: BackgroundTasks,
         if not data:
             return JSONResponse(status_code=400, content={"error": "El archivo llego vacio."})
 
-        # Registrar la fuente en estado 'procesando' y devolver de inmediato.
-        fid = uuid.uuid4().hex[:12]
-        FUENTES[fid] = {
-            "id": fid, "nombre": archivo.filename, "etiquetas": lista_etiquetas,
-            "texto": "", "n_chars": 0, "metodo": None,
-            "estado": "procesando", "error": None,
-        }
-        # Procesamiento pesado en segundo plano (threadpool, tras enviar la respuesta).
+        fid = crear_fuente_registro(cid, archivo.filename, lista_etiquetas)
         background_tasks.add_task(_procesar_fuente, fid, archivo.filename, data)
-
-        return JSONResponse(status_code=202, content=_fuente_publica(FUENTES[fid]))
+        return JSONResponse(status_code=202, content=obtener_fuente_publica(fid))
 
     except Exception as e:
         return JSONResponse(status_code=500, content={
-            "error": f"Error interno al registrar el documento: {type(e).__name__}: {e}"
-        })
+            "error": f"Error interno al registrar el documento: {type(e).__name__}: {e}"})
 
 
-@app.get("/api/fuentes/{fid}")
-def estado_fuente(fid: str):
-    """Estado de una fuente (para polling del frontend)."""
-    f = FUENTES.get(fid)
-    if f is None:
-        return JSONResponse(status_code=404, content={"error": "Fuente no encontrada."})
-    return _fuente_publica(f)
+@app.get("/api/casos/{cid}/fuentes/{fid}")
+def api_estado_fuente(cid: str, fid: str):
+    pub = obtener_fuente_publica(fid)
+    if pub is None or pub["caso_id"] != cid:
+        return JSONResponse(status_code=404, content={"error": "Fuente no encontrada en este caso."})
+    return pub
 
 
-@app.get("/api/fuentes")
-def listar_fuentes():
-    return [_fuente_publica(f) for f in FUENTES.values()]
+@app.delete("/api/casos/{cid}/fuentes/{fid}")
+def api_borrar_fuente(cid: str, fid: str):
+    borrar_fuente(cid, fid)
+    return {"ok": True}
 
 
-@app.delete("/api/fuentes/{fid}")
-def borrar_fuente(fid: str):
-    FUENTES.pop(fid, None)
-    return {"ok": True, "restantes": len(FUENTES)}
-
-
-# =========================== CHAT/ANALISIS =====================
+# ---- Chat / Analisis (aislado por caso) ----
 @app.post("/api/chat")
 def chat(m: Mensaje):
     pregunta = (m.pregunta or "").strip()
 
-    # Fuentes activas: solo las encendidas, que existan y que esten LISTAS
-    # (las que aun estan 'procesando' o en 'error' se ignoran en este turno).
-    activos = [FUENTES[i] for i in m.fuentes_activas
-               if i in FUENTES and FUENTES[i].get("estado") == "listo"]
+    if not m.caso_id or not caso_existe(m.caso_id):
+        return JSONResponse(status_code=400, content={"error": "Caso no valido o no seleccionado."})
+
+    # AISLAMIENTO: solo fuentes de ESTE caso, encendidas y en estado 'listo'.
+    activos = fuentes_activas_texto(m.caso_id, m.fuentes_activas)
     etiquetas = sorted({e for f in activos for e in f["etiquetas"]})
 
     if not pregunta and not activos:
         return JSONResponse(status_code=400, content={
-            "error": "Escribe una consulta o activa al menos una fuente del caso."
-        })
+            "error": "Escribe una consulta o activa al menos una fuente del caso."})
 
     # Contexto de las fuentes activas (concatenado y acotado).
     partes = []
@@ -248,13 +428,12 @@ def chat(m: Mensaje):
         partes.append(cab + "\n" + f["texto"])
     contexto_fuentes = "\n\n".join(partes)[:MAX_CONTEXT_CHARS]
 
-    # Recuperacion en la base vectorial (guiada por la pregunta + etiquetas + extracto).
+    # Recuperacion en la base vectorial (guiada por pregunta + etiquetas + extracto).
     base_query = pregunta or (", ".join(etiquetas))
     consulta = (base_query + "\n" + contexto_fuentes[:QUERY_DOC_CHARS]).strip()
     filas = recuperar(consulta, k=m.k) if consulta else []
     contexto_normas = construir_contexto(filas) if filas else "(sin normas recuperadas)"
 
-    # Construccion del prompt segun el modo.
     secciones = [f"NORMAS RECUPERADAS (base vectorial):\n{contexto_normas}"]
     if contexto_fuentes:
         secciones.append("DOCUMENTOS DEL CASO (fuentes activas seleccionadas por el usuario):\n"
@@ -265,23 +444,21 @@ def chat(m: Mensaje):
     if m.modo == "analisis":
         sistema = _sistema_auditoria(etiquetas)
         secciones.append("TAREA: Realiza la auditoria legal de las fuentes activas segun las "
-                         "instrucciones del sistema." + (f"\nFoco adicional del usuario: {pregunta}" if pregunta else ""))
+                         "instrucciones del sistema." +
+                         (f"\nFoco adicional del usuario: {pregunta}" if pregunta else ""))
     else:
         sistema = _sistema_chat()
         secciones.append(f"CONSULTA DEL USUARIO:\n{pregunta or '(resume y comenta las fuentes activas)'}")
 
     prompt = "\n\n".join(secciones)
 
-    # MEMORIA MULTI-TURNO: el historial previo se inyecta como turnos nativos
-    # user/model; la nueva pregunta (con el contexto RAG + documentos activos)
-    # va como turno final 'user'. Las instrucciones del sistema van en config.
+    # MEMORIA MULTI-TURNO: historial previo como turnos nativos user/model.
     contents = []
     for t in m.historial[-MAX_TURNOS_HISTORIAL:]:
         rol = "model" if (t.rol or "").lower() in ("model", "assistant", "ia", "bot") else "user"
         txt = (t.texto or "").strip()
         if txt:
             contents.append(Content(role=rol, parts=[Part(text=txt)]))
-    # Gemini exige que la conversacion empiece con un turno 'user'.
     while contents and contents[0].role == "model":
         contents.pop(0)
     contents.append(Content(role="user", parts=[Part(text=prompt)]))
@@ -311,11 +488,10 @@ HTML = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Asistente de Contrataciones Publicas</title>
+<title>Asistente de Contrataciones Públicas — Repositorio de Casos</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   .scroll-y { overflow-y: auto; }
-  /* Interruptor (toggle) */
   .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider { position: absolute; cursor: pointer; inset: 0; background: #cbd5e1; border-radius: 9999px; transition: .2s; }
@@ -323,72 +499,92 @@ HTML = r"""
   input:checked + .slider { background: #2563eb; }
   input:checked + .slider:before { transform: translateX(16px); }
   .prosa { white-space: pre-wrap; line-height: 1.6; }
+  .hidden-x { display: none; }
 </style>
 </head>
 <body class="h-screen bg-slate-100 text-slate-800">
 <div class="flex h-screen">
 
-  <!-- ============ PANEL IZQUIERDO (30%) : FUENTES ============ -->
+  <!-- ============ PANEL IZQUIERDO (30%) ============ -->
   <aside class="w-[30%] min-w-[300px] max-w-[460px] bg-white border-r border-slate-200 flex flex-col">
-    <div class="px-5 py-4 border-b border-slate-200">
-      <h1 class="text-base font-semibold text-slate-900">Fuentes del Caso</h1>
-      <p class="text-xs text-slate-500 mt-1">Sube documentos y actívalos con el interruptor para usarlos como contexto.</p>
-    </div>
 
-    <!-- Subida -->
-    <div class="px-5 py-4 border-b border-slate-200 space-y-3">
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-1">Documento (.pdf o .docx)</label>
-        <input id="file" type="file" accept=".pdf,.docx"
-               class="block w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
+    <!-- VISTA A: REPOSITORIO DE CASOS -->
+    <div id="vistaCasos" class="flex flex-col h-full">
+      <div class="px-5 py-4 border-b border-slate-200">
+        <h1 class="text-base font-semibold text-slate-900">Mis Casos</h1>
+        <p class="text-xs text-slate-500 mt-1">Cada caso agrupa sus propios documentos y su conversación.</p>
       </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-1">Etiquetas (Enter o coma)</label>
-        <div id="tagbox" class="flex flex-wrap items-center gap-1 border border-slate-300 rounded-md px-2 py-1.5">
-          <input id="tagin" type="text" placeholder="Ej: Contrato, Ejecucion, Moquegua"
-                 class="flex-1 min-w-[120px] outline-none text-xs py-0.5">
+      <div class="px-5 py-4 border-b border-slate-200">
+        <label class="block text-xs font-semibold text-slate-600 mb-1">Nuevo caso</label>
+        <div class="flex gap-2">
+          <input id="nombreCaso" type="text" placeholder="Ej: Licitación carretera MO-108"
+                 class="flex-1 border border-slate-300 rounded-md px-3 py-2 text-sm outline-none focus:border-blue-500"
+                 onkeydown="if(event.key==='Enter'){event.preventDefault();crearCaso();}">
         </div>
+        <button onclick="crearCaso()"
+                class="mt-2 w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-md py-2 transition">
+          + Crear Nuevo Caso
+        </button>
       </div>
-      <button id="btnAdd" onclick="agregarFuente()"
-              class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-md py-2 transition">
-        + Agregar fuente
-      </button>
-      <p class="text-[11px] text-slate-400">El texto se procesa de forma temporal (OCR automático si el PDF está escaneado). No se almacena en la base vectorial.</p>
-      <p id="errAdd" class="hidden text-xs text-red-600 font-semibold bg-red-50 border border-red-200 rounded-md px-2 py-1.5"></p>
+      <div id="listaCasos" class="flex-1 scroll-y px-4 py-3 space-y-2">
+        <p class="text-xs text-slate-400 px-1 py-2">Cargando casos...</p>
+      </div>
     </div>
 
-    <!-- Lista de fuentes -->
-    <div id="lista" class="flex-1 scroll-y px-4 py-3 space-y-2"></div>
+    <!-- VISTA B: FUENTES DEL CASO -->
+    <div id="vistaFuentes" class="hidden-x flex-col h-full">
+      <div class="px-5 py-3 border-b border-slate-200">
+        <button onclick="volverCasos()" class="text-xs text-blue-700 hover:underline mb-2">&larr; Volver a Mis Casos</button>
+        <h1 id="tituloCaso" class="text-base font-semibold text-slate-900 truncate">Fuentes del Caso</h1>
+        <p class="text-xs text-slate-500 mt-1">Sube documentos y actívalos con el interruptor para usarlos como contexto.</p>
+      </div>
 
-    <div class="px-5 py-2 border-t border-slate-200 text-[11px] text-slate-400">
-      <span id="contador">0</span> fuente(s) · <span id="activas">0</span> activa(s)
+      <div class="px-5 py-4 border-b border-slate-200 space-y-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Documentos (.pdf o .docx) — puedes elegir varios</label>
+          <input id="file" type="file" accept=".pdf,.docx" multiple
+                 class="block w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Etiquetas (Enter o coma)</label>
+          <div id="tagbox" class="flex flex-wrap items-center gap-1 border border-slate-300 rounded-md px-2 py-1.5">
+            <input id="tagin" type="text" placeholder="Ej: Contrato, Ejecucion, Moquegua"
+                   class="flex-1 min-w-[120px] outline-none text-xs py-0.5">
+          </div>
+        </div>
+        <button id="btnAdd" onclick="agregarFuente()"
+                class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-md py-2 transition">
+          + Agregar fuente
+        </button>
+        <p class="text-[11px] text-slate-400">Selecciona uno o varios archivos (Ctrl/Shift o arrástralos). El texto se procesa de forma temporal (OCR automático si el PDF está escaneado).</p>
+        <p id="errAdd" class="hidden-x text-xs text-red-600 font-semibold bg-red-50 border border-red-200 rounded-md px-2 py-1.5"></p>
+      </div>
+
+      <div id="lista" class="flex-1 scroll-y px-4 py-3 space-y-2"></div>
+      <div class="px-5 py-2 border-t border-slate-200 text-[11px] text-slate-400">
+        <span id="contador">0</span> fuente(s) · <span id="activas">0</span> activa(s)
+      </div>
     </div>
   </aside>
 
   <!-- ============ PANEL DERECHO (70%) : CHAT ============ -->
   <main class="flex-1 flex flex-col">
     <header class="px-6 py-4 bg-slate-900 text-white flex items-center justify-between gap-3">
-      <div>
+      <div class="min-w-0">
         <h2 class="text-base font-semibold">Asistente de Contrataciones Públicas</h2>
-        <p class="text-xs text-slate-300">El modelo responde usando solo las fuentes activas + el marco normativo (Ley y Reglamento).</p>
+        <p class="text-xs text-slate-300 truncate">Caso actual: <span id="casoEnChat">— (ninguno)</span></p>
       </div>
-      <button id="btnLimpiar" onclick="limpiarChat()" title="Limpiar chat y reiniciar la memoria de la conversación"
+      <button id="btnLimpiar" onclick="limpiarChat()" title="Limpiar chat del caso actual"
               class="flex items-center gap-1.5 bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium rounded-md px-3 py-2 transition whitespace-nowrap">
         <span>🧹</span> Limpiar Chat
       </button>
     </header>
 
-    <div id="chat" class="flex-1 scroll-y px-6 py-5 space-y-4">
-      <div class="flex">
-        <div class="bg-white border border-slate-200 rounded-2xl px-4 py-3 max-w-[85%] shadow-sm prosa text-sm">
-Hola. Sube documentos en el panel izquierdo, actívalos con su interruptor y pregúntame. También puedo cruzar tus documentos con la normativa. Si no activas ninguna fuente, respondo solo con base en la Ley y el Reglamento.
-        </div>
-      </div>
-    </div>
+    <div id="chat" class="flex-1 scroll-y px-6 py-5 space-y-4"></div>
 
     <div class="border-t border-slate-200 bg-white px-6 py-3">
       <div class="flex items-end gap-2">
-        <textarea id="q" rows="1" placeholder="Escribe tu consulta..."
+        <textarea id="q" rows="1" placeholder="Entra a un caso para chatear..."
                   class="flex-1 resize-none border border-slate-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();enviar('chat');}"></textarea>
         <button id="btnChat" onclick="enviar('chat')"
@@ -396,34 +592,119 @@ Hola. Sube documentos en el panel izquierdo, actívalos con su interruptor y pre
         <button id="btnAnal" onclick="enviar('analisis')"
                 class="bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium rounded-lg px-4 py-2 transition whitespace-nowrap">Ejecutar Análisis Legal</button>
       </div>
-      <p class="text-[11px] text-slate-400 mt-1">"Enviar" = pregunta normal · "Ejecutar Análisis Legal" = auditoría de las fuentes activas guiada por sus etiquetas.</p>
+      <p class="text-[11px] text-slate-400 mt-1">"Enviar" = pregunta · "Ejecutar Análisis Legal" = auditoría de las fuentes activas guiada por sus etiquetas.</p>
     </div>
   </main>
 </div>
 
 <script>
-let fuentes = [];     // {id, nombre, etiquetas[], metodo, activo}
-const tags = [];      // etiquetas en edicion
-let historial = [];   // memoria multi-turno: [{rol:'user'|'model', texto}]
-const MAX_HIST_CLIENTE = 40;  // tope para no crecer sin limite en el navegador
+let casoActual = null;   // {id, nombre}
+let fuentes = [];        // fuentes del caso actual
+let historial = [];      // memoria multi-turno del caso actual
+const tags = [];
+const MAX_HIST_CLIENTE = 40;
 
 function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function show(id){ document.getElementById(id).classList.remove('hidden-x'); }
+function hide(id){ document.getElementById(id).classList.add('hidden-x'); }
 
-// fetch con timeout via AbortController: si el servidor demora demasiado, aborta.
 async function fetchConTimeout(url, opts, ms){
   const ctrl = new AbortController();
   const t = setTimeout(()=>ctrl.abort(), ms);
   try { return await fetch(url, {...opts, signal: ctrl.signal}); }
   finally { clearTimeout(t); }
 }
-// Muestra/oculta el mensaje de error del panel de subida.
 function mostrarErrorAdd(msg){
   const el = document.getElementById('errAdd');
-  if(!msg){ el.classList.add('hidden'); el.textContent=''; return; }
-  el.textContent = msg; el.classList.remove('hidden');
+  if(!msg){ el.classList.add('hidden-x'); el.textContent=''; return; }
+  el.textContent = msg; el.classList.remove('hidden-x');
 }
 
-// ---------- Etiquetas (chips) ----------
+// =================== REPOSITORIO DE CASOS ===================
+async function cargarCasos(){
+  const cont = document.getElementById('listaCasos');
+  cont.innerHTML = '<p class="text-xs text-slate-400 px-1 py-2">Cargando casos...</p>';
+  try{
+    const r = await fetchConTimeout('/api/casos', {}, 20000);
+    const casos = await r.json();
+    if(!Array.isArray(casos) || !casos.length){
+      cont.innerHTML = '<p class="text-xs text-slate-400 px-1 py-2">No hay casos todavía. Crea el primero arriba.</p>';
+      return;
+    }
+    cont.innerHTML = '';
+    casos.forEach(c=>{
+      const card = document.createElement('div');
+      card.className = 'border border-slate-200 rounded-lg p-3 hover:bg-blue-50/60 cursor-pointer flex items-start gap-2';
+      card.onclick = ()=>entrarCaso(c);
+      const fecha = (c.fecha_creacion||'').replace('T',' ').slice(0,16);
+      card.innerHTML =
+        '<div class="flex-1 min-w-0">' +
+          '<div class="text-sm font-semibold text-slate-800 truncate">'+esc(c.nombre)+'</div>' +
+          '<div class="text-[10px] text-slate-400 mt-0.5">'+(c.n_fuentes||0)+' fuente(s) · '+esc(fecha)+'</div>' +
+        '</div>' +
+        '<button title="Eliminar caso" class="text-slate-400 hover:text-red-600 text-sm leading-none">&times;</button>';
+      card.querySelector('button').onclick = (ev)=>{ ev.stopPropagation(); borrarCaso(c); };
+      cont.appendChild(card);
+    });
+  }catch(e){
+    cont.innerHTML = '<p class="text-xs text-red-600 px-1 py-2">Error al cargar casos: '+esc(String(e))+'</p>';
+  }
+}
+async function crearCaso(){
+  const inp = document.getElementById('nombreCaso');
+  const nombre = inp.value.trim();
+  if(!nombre){ inp.focus(); return; }
+  try{
+    const r = await fetchConTimeout('/api/casos', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({nombre})}, 20000);
+    const c = await r.json();
+    inp.value='';
+    entrarCaso(c);
+  }catch(e){ alert('No se pudo crear el caso: '+e); }
+}
+async function borrarCaso(c){
+  if(!confirm('¿Eliminar el caso "'+c.nombre+'" y todos sus documentos?')) return;
+  await fetch('/api/casos/'+c.id, {method:'DELETE'});
+  cargarCasos();
+}
+
+// =================== ENTRAR / SALIR DE UN CASO ===================
+function setChat(enabled){
+  ['q','btnChat','btnAnal','btnLimpiar'].forEach(id=>document.getElementById(id).disabled = !enabled);
+  document.getElementById('q').placeholder = enabled ? 'Escribe tu consulta...' : 'Entra a un caso para chatear...';
+}
+function resetChatUI(msg){
+  historial = [];
+  document.getElementById('chat').innerHTML =
+    '<div class="flex"><div class="bg-white border border-slate-200 rounded-2xl px-4 py-3 max-w-[85%] shadow-sm prosa text-sm">'+msg+'</div></div>';
+}
+async function entrarCaso(c){
+  casoActual = c;
+  fuentes = []; tags.length = 0; pintarTags(); mostrarErrorAdd('');
+  document.getElementById('tituloCaso').textContent = c.nombre;
+  document.getElementById('casoEnChat').textContent = c.nombre;
+  hide('vistaCasos'); show('vistaFuentes');
+  setChat(true);
+  resetChatUI('Estás en el caso <b>'+esc(c.nombre)+'</b>. Sube documentos, actívalos y pregúntame. El chat y las fuentes son exclusivos de este caso.');
+  // Cargar fuentes del caso (aislado).
+  try{
+    const r = await fetch('/api/casos/'+c.id+'/fuentes');
+    const d = await r.json();
+    fuentes = (Array.isArray(d)?d:[]).map(f=>({...f, activo:true}));
+    pintarFuentes();
+    fuentes.forEach(f=>{ if((f.estado||'listo')==='procesando') pollFuente(f.id); });
+  }catch(e){ document.getElementById('lista').innerHTML = '<p class="text-xs text-red-600">Error al cargar fuentes.</p>'; }
+}
+function volverCasos(){
+  casoActual = null; fuentes = []; historial = [];
+  hide('vistaFuentes'); show('vistaCasos');
+  setChat(false);
+  document.getElementById('casoEnChat').textContent = '— (ninguno)';
+  resetChatUI('Selecciona un caso en el panel izquierdo o crea uno nuevo para empezar.');
+  cargarCasos();
+}
+
+// =================== ETIQUETAS (chips) ===================
 const tagbox = document.getElementById('tagbox'), tagin = document.getElementById('tagin');
 function pintarTags(){
   tagbox.querySelectorAll('.tagchip').forEach(e=>e.remove());
@@ -441,14 +722,14 @@ tagin.addEventListener('keydown', e=>{
   else if(e.key==='Backspace' && !tagin.value && tags.length){ quitarTag(tags.length-1); }
 });
 
-// ---------- Fuentes ----------
+// =================== FUENTES DEL CASO ===================
 function contar(){
   document.getElementById('contador').textContent = fuentes.length;
   document.getElementById('activas').textContent = fuentes.filter(f=>f.activo && (f.estado||'listo')==='listo').length;
 }
 function pintarFuentes(){
   const cont = document.getElementById('lista');
-  if(!fuentes.length){ cont.innerHTML = '<p class="text-xs text-slate-400 px-1 py-2">Aún no hay fuentes. Agrega un documento arriba.</p>'; contar(); return; }
+  if(!fuentes.length){ cont.innerHTML = '<p class="text-xs text-slate-400 px-1 py-2">Aún no hay fuentes en este caso.</p>'; contar(); return; }
   cont.innerHTML = '';
   fuentes.forEach(f=>{
     const estado = f.estado || 'listo';
@@ -459,13 +740,9 @@ function pintarFuentes(){
         : (listo && f.activo) ? 'bg-blue-50/60 border-slate-200'
         : 'bg-slate-50 border-slate-200');
     const tagsHtml = (f.etiquetas||[]).map(t=>'<span class="bg-slate-200 text-slate-600 rounded px-1.5 py-0.5 text-[10px]">'+esc(t)+'</span>').join(' ');
-
-    // Interruptor: deshabilitado mientras la fuente no este 'listo'.
     const dis = listo ? '' : 'disabled';
     const toggle = '<label class="switch mt-0.5"><input type="checkbox" '+(f.activo&&listo?'checked':'')+' '+dis+
                    ' onchange="toggleFuente(\''+f.id+'\', this.checked)"><span class="slider"></span></label>';
-
-    // Linea de estado segun procesando / listo / error.
     let estadoHtml;
     if(estado==='procesando'){
       estadoHtml = '<div class="text-[10px] text-amber-600 font-semibold mb-1 flex items-center gap-1">' +
@@ -477,10 +754,8 @@ function pintarFuentes(){
       const ocr = f.metodo==='ocr' ? '<span class="text-[10px] text-green-700 font-semibold">OCR</span>' : '';
       estadoHtml = '<div class="text-[10px] text-slate-400 mb-1">'+(f.n_chars||0).toLocaleString()+' chars '+ocr+'</div>';
     }
-
     card.innerHTML =
-      '<div class="flex items-start gap-2">' +
-        toggle +
+      '<div class="flex items-start gap-2">' + toggle +
         '<div class="flex-1 min-w-0">' +
           '<div class="text-xs font-semibold text-slate-800 truncate" title="'+esc(f.nombre)+'">'+esc(f.nombre)+'</div>' +
           estadoHtml +
@@ -494,78 +769,80 @@ function pintarFuentes(){
 }
 function toggleFuente(id, val){ const f=fuentes.find(x=>x.id===id); if(f){ f.activo=val; } contar(); pintarFuentes(); }
 
-// Polling del estado de una fuente hasta 'listo' o 'error'.
 function pollFuente(id){
+  const casoId = casoActual ? casoActual.id : null;
   let intentos = 0;
   const iv = setInterval(async ()=>{
     intentos++;
+    if(!casoActual || casoActual.id !== casoId){ clearInterval(iv); return; }  // salio del caso
     const f = fuentes.find(x=>x.id===id);
-    if(!f){ clearInterval(iv); return; }              // fue eliminada
+    if(!f){ clearInterval(iv); return; }
     if(intentos > 120){ clearInterval(iv); f.estado='error'; f.error='Tiempo de espera agotado (5 min).'; pintarFuentes(); return; }
     try{
-      const r = await fetch('/api/fuentes/'+id);
+      const r = await fetch('/api/casos/'+casoId+'/fuentes/'+id);
       if(r.status===404){ clearInterval(iv); return; }
-      if(!r.ok) return;                                // reintenta en el proximo tick
+      if(!r.ok) return;
       const d = await r.json();
       f.estado=d.estado; f.n_chars=d.n_chars; f.metodo=d.metodo; f.error=d.error;
       if(d.estado!=='procesando'){ clearInterval(iv); }
       pintarFuentes();
-    }catch(e){ /* error transitorio: reintenta */ }
+    }catch(e){ /* reintenta */ }
   }, 2500);
 }
 async function borrarFuente(id){
-  await fetch('/api/fuentes/'+id, {method:'DELETE'});
+  if(!casoActual) return;
+  await fetch('/api/casos/'+casoActual.id+'/fuentes/'+id, {method:'DELETE'});
   fuentes = fuentes.filter(x=>x.id!==id); pintarFuentes();
 }
-async function agregarFuente(){
-  mostrarErrorAdd('');  // limpia errores previos
+// Subida MULTIPLE: recorre todos los archivos seleccionados y dispara una
+// subida asincrona INDEPENDIENTE por cada uno (cada una con su tarjeta y polling).
+function agregarFuente(){
+  mostrarErrorAdd('');
+  if(!casoActual){ mostrarErrorAdd('Entra a un caso primero.'); return; }
   if(tagin.value){ agregarTag(tagin.value); tagin.value=''; }
-  const f = document.getElementById('file').files[0];
-  if(!f){ mostrarErrorAdd('Selecciona un archivo .pdf o .docx.'); return; }
+  const input = document.getElementById('file');
+  const archivos = Array.from(input.files || []);
+  if(!archivos.length){ mostrarErrorAdd('Selecciona uno o más archivos .pdf o .docx.'); return; }
 
-  const btn = document.getElementById('btnAdd');
-  btn.disabled = true; btn.textContent = 'Procesando...';
-  const fd = new FormData(); fd.append('archivo', f); fd.append('etiquetas', tags.join(','));
+  // Las etiquetas actuales se aplican a todo el lote.
+  const etiquetasLote = tags.slice();
+  const casoId = casoActual.id;
 
-  // CORRECCION 2: try/catch robusto con timeout. Pase lo que pase (timeout,
-  // error 500, red caida), el boton SIEMPRE vuelve a su estado y se muestra el error.
+  // LIMPIEZA DEL FORMULARIO: listo de inmediato para una nueva subida.
+  input.value = '';
+  tags.length = 0; pintarTags();
+
+  // Dispara cada subida de forma concurrente (no se espera una por una).
+  archivos.forEach(f => subirUnArchivo(casoId, f, etiquetasLote));
+}
+
+// Sube UN archivo: crea su tarjeta 'Procesando...' y arranca su propio polling.
+async function subirUnArchivo(casoId, file, etiquetasArr){
+  const fd = new FormData();
+  fd.append('archivo', file);
+  fd.append('etiquetas', etiquetasArr.join(','));
   try{
-    const r = await fetchConTimeout('/api/fuentes', {method:'POST', body:fd}, 180000); // 3 min
-    let d = {};
-    try { d = await r.json(); } catch(_){ d = {}; }
-
-    if(!r.ok){
-      mostrarErrorAdd('El servidor respondió con error ' + r.status + ': ' + (d.error || 'fallo interno al procesar el documento.'));
-      return;
-    }
-    if(d.error){ mostrarErrorAdd(d.error); return; }
-
-    // La fuente queda 'procesando'; se activa por defecto y se hace polling hasta 'listo'.
+    const r = await fetchConTimeout('/api/casos/'+casoId+'/fuentes', {method:'POST', body:fd}, 60000);
+    let d = {}; try { d = await r.json(); } catch(_){ d = {}; }
+    // Si el usuario salio del caso mientras subia, descartar el resultado.
+    if(!casoActual || casoActual.id !== casoId) return;
+    if(!r.ok){ mostrarErrorAdd('Error '+r.status+' al subir "'+file.name+'": '+(d.error||'fallo al subir.')); return; }
+    if(d.error){ mostrarErrorAdd('"'+file.name+'": '+d.error); return; }
     d.activo = true; fuentes.push(d); pintarFuentes();
-    if((d.estado||'listo') === 'procesando'){ pollFuente(d.id); }
-    document.getElementById('file').value=''; tags.length=0; pintarTags();
+    if((d.estado||'listo')==='procesando'){ pollFuente(d.id); }
   }catch(e){
-    if(e && e.name === 'AbortError'){
-      mostrarErrorAdd('La subida tardó demasiado y se canceló (timeout). Intenta con un archivo más liviano o reinténtalo.');
-    } else {
-      mostrarErrorAdd('No se pudo subir el documento: ' + (e && e.message ? e.message : e));
-    }
-  }finally{
-    // GARANTIZADO: el boton sale de "Procesando..." en todos los casos.
-    btn.disabled = false; btn.textContent = '+ Agregar fuente';
+    if(!casoActual || casoActual.id !== casoId) return;
+    if(e && e.name==='AbortError'){ mostrarErrorAdd('La subida de "'+file.name+'" tardó demasiado y se canceló (timeout).'); }
+    else { mostrarErrorAdd('No se pudo subir "'+file.name+'": ' + (e && e.message ? e.message : e)); }
   }
 }
 
-// ---------- Chat ----------
+// =================== CHAT ===================
 const chat = document.getElementById('chat');
-const BIENVENIDA = '<div class="flex"><div class="bg-white border border-slate-200 rounded-2xl px-4 py-3 max-w-[85%] shadow-sm prosa text-sm">Hola. Sube documentos en el panel izquierdo, actívalos con su interruptor y pregúntame. Puedo recordar el hilo de la conversación para preguntas de seguimiento; usa "🧹 Limpiar Chat" para reiniciar la memoria al cambiar de tema.</div></div>';
-
-// Limpia el chat y REINICIA la memoria multi-turno.
 function limpiarChat(){
-  historial = [];
-  chat.innerHTML = BIENVENIDA;
+  if(!casoActual) return;
+  resetChatUI('Chat reiniciado para el caso <b>'+esc(casoActual.nombre)+'</b>.');
 }
-
 function addMsg(html, lado){
   const wrap = document.createElement('div'); wrap.className = 'flex ' + (lado==='user'?'justify-end':'');
   const b = document.createElement('div');
@@ -576,14 +853,13 @@ function addMsg(html, lado){
   chat.scrollTop = chat.scrollHeight; return b;
 }
 async function enviar(modo){
+  if(!casoActual){ return; }
   const q = document.getElementById('q');
   const texto = q.value.trim();
-  // Solo fuentes activas Y listas (las que aun procesan o fallaron no cuentan).
   const activas = fuentes.filter(f=>f.activo && (f.estado||'listo')==='listo').map(f=>f.id);
   if(modo==='chat' && !texto && !activas.length){ return; }
   if(modo==='analisis' && !activas.length){ addMsg('Activa al menos una fuente (lista) para ejecutar el análisis legal.', 'bot'); return; }
 
-  // Texto que representa este turno del usuario en la memoria.
   const userTxt = texto || (modo==='analisis' ? '[Solicitud de análisis legal de las fuentes activas]' : '');
   if(texto) addMsg(esc(texto), 'user');
   else if(modo==='analisis') addMsg('<i>Ejecutar análisis legal de las fuentes activas</i>', 'user');
@@ -592,12 +868,11 @@ async function enviar(modo){
   const cargando = addMsg('<span class="text-slate-400 italic">Analizando con las fuentes activas y la normativa...</span>', 'bot');
   try{
     const r = await fetchConTimeout('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({pregunta: texto, fuentes_activas: activas, modo: modo, k: 5,
+      body: JSON.stringify({caso_id: casoActual.id, pregunta: texto, fuentes_activas: activas, modo: modo, k: 5,
                             historial: historial.slice(-MAX_HIST_CLIENTE)})}, 180000);
     let d = {}; try { d = await r.json(); } catch(_){ d = {}; }
     if(!r.ok){ cargando.innerHTML = '<span class="text-amber-700">Error '+r.status+': '+esc(d.error||'fallo del servidor')+'</span>'; return; }
     if(d.error){ cargando.innerHTML = '<span class="text-amber-700">'+esc(d.error)+'</span>'; return; }
-
     let h = esc(d.respuesta || 'Sin respuesta.');
     if(d.fuentes_usadas && d.fuentes_usadas.length){
       h += '<div class="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500"><b>Fuentes del caso usadas:</b> '
@@ -608,8 +883,6 @@ async function enviar(modo){
          + d.fuentes_normativas.map(s=>'<span class="inline-block bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 mt-1 mr-1">'+esc(s.documento)+', Art. '+esc(String(s.articulo_num))+'</span>').join('') + '</div>';
     }
     cargando.innerHTML = h;
-
-    // Registrar el turno en la memoria multi-turno (texto plano).
     if(userTxt) historial.push({rol:'user', texto:userTxt});
     historial.push({rol:'model', texto: d.respuesta || ''});
     if(historial.length > MAX_HIST_CLIENTE) historial = historial.slice(-MAX_HIST_CLIENTE);
@@ -620,16 +893,11 @@ async function enviar(modo){
   finally{ document.getElementById('btnChat').disabled=false; document.getElementById('btnAnal').disabled=false; chat.scrollTop=chat.scrollHeight; }
 }
 
-// ---------- Init ----------
-(async function(){
-  try{ const r = await fetch('/api/fuentes'); const d = await r.json();
-    fuentes = (d||[]).map(f=>({...f, activo:true})); }catch(e){}
-  pintarFuentes();
-  // Reanudar polling de cualquier fuente que siga procesando (p.ej. tras recargar).
-  fuentes.forEach(f=>{ if((f.estado||'listo')==='procesando') pollFuente(f.id); });
-})();
+// =================== INIT ===================
+setChat(false);
+resetChatUI('Selecciona un caso en el panel izquierdo o crea uno nuevo para empezar.');
+cargarCasos();
 </script>
 </body>
 </html>
 """
-

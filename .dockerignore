@@ -1,0 +1,18 @@
+# No incluir en la imagen de Cloud Run
+google-cloud-sdk/
+__pycache__/
+*.pyc
+*.json
+*.jsonl
+*.pdf
+*.docx
+Desktop/
+.claude/
+# Scripts de pipeline (no se necesitan en el servidor de consultas)
+# NOTA: extraccion_texto.py SI se incluye (lo usa el modulo de analisis).
+crear_datalake.py
+subida_masiva.py
+chunking_articulos.py
+generar_embeddings.py
+indexar_bigquery.py
+buscar.py

@@ -1,0 +1,31 @@
+# =================================================================
+#  .gitignore de LISTA BLANCA
+#  Este repositorio vive en C:\Users\Usuario (carpeta de usuario),
+#  por lo que IGNORAMOS TODO por defecto y solo versionamos los
+#  archivos del proyecto. Asi nunca entran credenciales, el SDK de
+#  gcloud, AppData, el Escritorio ni otros datos sensibles.
+# =================================================================
+
+# 1) Ignorar absolutamente todo en la raiz.
+/*
+
+# 2) Versionar SOLO estos archivos del proyecto:
+!.gitignore
+!README.md
+!.dockerignore
+
+# Pipeline RAG (Data Lake -> indexacion)
+!crear_datalake.py
+!subida_masiva.py
+!extraccion_texto.py
+!chunking_articulos.py
+!generar_embeddings.py
+!indexar_bigquery.py
+!buscar.py
+!responder.py
+
+# Aplicacion web (API + UI) y despliegue
+!app.py
+!Dockerfile
+!requirements.txt
+!desplegar_cloudrun.ps1

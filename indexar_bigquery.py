@@ -50,6 +50,9 @@ SCHEMA = [
     bigquery.SchemaField("parte", "INTEGER"),
     bigquery.SchemaField("n_chars", "INTEGER"),
     bigquery.SchemaField("texto", "STRING"),
+    # Metadatos para BUSQUEDA HIBRIDA (pre-filtering): se inyectan junto al embedding.
+    bigquery.SchemaField("anio", "INTEGER"),       # ano de emision del documento
+    bigquery.SchemaField("vigente", "BOOLEAN"),    # True = vigente; False = derogada
     bigquery.SchemaField("embedding", "FLOAT64", mode="REPEATED"),
 ]
 
@@ -115,6 +118,8 @@ def main():
             "parte": c.get("parte"),
             "n_chars": c.get("n_chars"),
             "texto": c.get("texto"),
+            "anio": c.get("anio"),                 # metadato para pre-filtering
+            "vigente": c.get("vigente", True),     # por defecto: vigente
             "embedding": vects[cid],
         })
     if sin_vector:

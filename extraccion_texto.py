@@ -134,6 +134,106 @@ def extraer_pdf_inteligente(data_bytes):
     return texto_ocr, n_ocr, "ocr"
 
 
+# ============================================================================
+#  MOTORES DE EXTRACCION ADICIONALES (uso del modulo web app.py)
+#  Imagenes -> OCR Vision | Excel/CSV -> Tabla Markdown (mejor para el LLM)
+# ============================================================================
+
+MAX_FILAS_TABLA = 2000   # tope de filas por hoja para no inflar el contexto del LLM
+
+
+def ocr_imagen_vision(data_bytes):
+    """OCR de una imagen (png/jpg/jpeg) con Google Cloud Vision
+    (DOCUMENT_TEXT_DETECTION). Extrae texto impreso, numeros de serie, marcas o
+    notas tecnicas. Devuelve texto plano ('' si la imagen no contiene texto)."""
+    from google.cloud import vision
+    client = vision.ImageAnnotatorClient()
+    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
+    contexto = vision.ImageContext(language_hints=OCR_IDIOMAS)
+    req = vision.AnnotateImageRequest(
+        image=vision.Image(content=data_bytes), features=[feature], image_context=contexto)
+    resp = client.batch_annotate_images(requests=[req]).responses[0]
+    if resp.error.message:
+        raise RuntimeError(f"Cloud Vision: {resp.error.message}")
+    return resp.full_text_annotation.text or ""
+
+
+def _matriz_a_markdown(filas, titulo=None):
+    """Convierte una matriz (lista de filas; cada fila lista de celdas) en una
+    TABLA MARKDOWN. Los LLM procesan vectores de celdas con mucha mayor precision
+    bajo esta estructura. La 1a fila no vacia se usa como encabezado."""
+    filas = [f for f in filas if any((c is not None and str(c).strip() != "") for c in f)]
+    if not filas:
+        return ""
+    truncado = len(filas) > MAX_FILAS_TABLA
+    if truncado:
+        filas = filas[:MAX_FILAS_TABLA]
+    ancho = max(len(f) for f in filas)
+
+    def celda(v):
+        s = "" if v is None else str(v)
+        return s.replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+    norm = [[celda(f[i]) if i < len(f) else "" for i in range(ancho)] for f in filas]
+    lineas = []
+    if titulo:
+        lineas.append(f"### {titulo}")
+    lineas.append("| " + " | ".join(norm[0]) + " |")
+    lineas.append("| " + " | ".join(["---"] * ancho) + " |")
+    for r in norm[1:]:
+        lineas.append("| " + " | ".join(r) + " |")
+    if truncado:
+        lineas.append(f"_(tabla truncada a {MAX_FILAS_TABLA} filas)_")
+    return "\n".join(lineas)
+
+
+def extraer_xlsx(data_bytes):
+    """Lee un .xlsx (openpyxl) y devuelve (texto Markdown de todas las hojas, n_filas)."""
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data_bytes), read_only=True, data_only=True)
+    bloques, total = [], 0
+    try:
+        for ws in wb.worksheets:
+            filas = [list(fila) for fila in ws.iter_rows(values_only=True)]
+            md = _matriz_a_markdown(filas, titulo=f"Hoja: {ws.title}")
+            if md:
+                bloques.append(md)
+                total += len(filas)
+    finally:
+        wb.close()
+    return "\n\n".join(bloques), total
+
+
+def extraer_xls(data_bytes):
+    """Lee un .xls (Excel 97-2003, xlrd) y devuelve (texto Markdown, n_filas)."""
+    import xlrd
+    libro = xlrd.open_workbook(file_contents=data_bytes)
+    bloques, total = [], 0
+    for hoja in libro.sheets():
+        filas = [hoja.row_values(r) for r in range(hoja.nrows)]
+        md = _matriz_a_markdown(filas, titulo=f"Hoja: {hoja.name}")
+        if md:
+            bloques.append(md)
+            total += hoja.nrows
+    return "\n\n".join(bloques), total
+
+
+def extraer_csv(data_bytes):
+    """Lee un .csv (stdlib csv, sin pandas) y devuelve (texto Markdown, n_filas).
+    Detecta codificacion (utf-8/latin-1) y delimitador (coma, ; , tab, |)."""
+    import csv
+    try:
+        texto = data_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        texto = data_bytes.decode("latin-1", errors="replace")
+    try:
+        dialecto = csv.Sniffer().sniff(texto[:4096], delimiters=",;\t|")
+    except csv.Error:
+        dialecto = csv.excel
+    filas = list(csv.reader(io.StringIO(texto), dialecto))
+    return _matriz_a_markdown(filas, titulo=None), len(filas)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extraccion de texto de PDFs/DOCX en GCS.")
     parser.add_argument("--solo", default=None,

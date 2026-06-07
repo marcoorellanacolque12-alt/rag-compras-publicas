@@ -502,7 +502,7 @@ class Mensaje(BaseModel):
 # ============================ HELPERS RAG ============================
 def _fuentes_normativas(filas):
     return [{
-        "documento": doc_label(f["documento"]),   # etiquetado unificado (responder.doc_label)
+        "documento": doc_label(f["documento"], f.get("chunk_id")),   # etiquetado unificado
         "articulo_num": f["articulo_num"],
         "articulo_titulo": f["articulo_titulo"],
         "relevancia": round(1 - f["distance"], 3),

@@ -292,7 +292,7 @@ def listar_normas():
         did = r["doc_id"] or ""
         out.append({
             "doc_id": did,
-            "label": doc_label(r["documento"]),
+            "label": doc_label(r["documento"], did),
             "categoria": r["categoria"],
             "anio": r["anio"],
             "vigente": bool(r["vigente"]) if r["vigente"] is not None else True,
@@ -315,7 +315,7 @@ def recuperar(pregunta, k, filtros=None):
     relacion = f"(SELECT * FROM {tabla} WHERE {where})" if where else f"TABLE {tabla}"
 
     sql = f"""
-    SELECT base.documento AS documento, base.articulo_num AS articulo_num,
+    SELECT base.chunk_id AS chunk_id, base.documento AS documento, base.articulo_num AS articulo_num,
            base.articulo_titulo AS articulo_titulo, base.texto AS texto, distance
     FROM VECTOR_SEARCH(
       {relacion}, 'embedding',
@@ -383,11 +383,16 @@ def eliminar_por_prefijo(prefijo_chunk_id):
     bq.query(sql, job_config=cfg, location=BQ_LOCATION).result()
 
 
-def doc_label(documento):
+def doc_label(documento, chunk_id=None):
     """Etiqueta legible y UNICA de un documento del vector store (FUENTE DE VERDAD
-    compartida: la usan responder.py y app.py). Para documentos institucionales de la
-    Biblioteca devuelve su propio nombre, evitando citarlos erroneamente como 'Reglamento'."""
+    compartida: la usan responder.py y app.py).
+    Los documentos de la Biblioteca (chunk_id 'bib_<id>__...') usan SIEMPRE su propio
+    nombre: asi una directiva cuyo nombre contiene 'reglamento'/'ley-general' no se
+    etiqueta (ni se cita) erroneamente como 'Reglamento'/'Ley'. El mapeo Ley/Reglamento
+    solo aplica al corpus normativo."""
     d = documento or ""
+    if chunk_id and str(chunk_id).startswith("bib_"):
+        return d or "Documento"
     if "ley-general" in d:
         return "Ley"
     if "reglamento" in d:
@@ -399,7 +404,7 @@ def construir_contexto(filas):
     """Arma el bloque de contexto con los fragmentos numerados."""
     bloques = []
     for i, f in enumerate(filas, start=1):
-        doc = doc_label(f["documento"])
+        doc = doc_label(f["documento"], f.get("chunk_id"))
         texto = " ".join(f["texto"].split())
         bloques.append(
             f"[Fragmento {i}] ({doc}, Art. {f['articulo_num']} - {f['articulo_titulo']})\n{texto}"
@@ -451,7 +456,7 @@ def main():
     print(texto)
     print("\n--- FUENTES RECUPERADAS ---")
     for i, f in enumerate(filas, start=1):
-        doc = doc_label(f["documento"])
+        doc = doc_label(f["documento"], f.get("chunk_id"))
         print(f"  [{i}] {doc}, Art. {f['articulo_num']}: {f['articulo_titulo']} "
               f"(coseno {1 - f['distance']:.3f})")
 

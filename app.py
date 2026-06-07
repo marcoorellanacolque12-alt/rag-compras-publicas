@@ -1069,6 +1069,9 @@ HTML = r"""
   input:checked + .slider:before { transform: translateX(16px); }
   .prosa { white-space: pre-wrap; line-height: 1.6; }
   .hidden-x { display: none; }
+  .panel-oculto { display: none !important; }   /* colapso del panel normativo (responsive-safe) */
+  /* Mide comoda para el chat: limita el ancho de cada turno y lo centra */
+  #chat > div { max-width: 56rem; margin-left: auto; margin-right: auto; width: 100%; }
 </style>
 </head>
 <body class="h-screen bg-slate-950 text-slate-200">
@@ -1224,89 +1227,118 @@ HTML = r"""
     </div>
   </aside>
 
-  <!-- ============ PANEL DERECHO (70%) : CHAT ============ -->
-  <main class="flex-1 flex flex-col bg-slate-950">
-    <header class="px-6 py-4 bg-slate-900 border-b border-slate-800 text-white flex items-center justify-between gap-3">
+  <!-- ============ CENTRO: SOLO CHAT ============ -->
+  <main class="flex-1 min-w-0 flex flex-col bg-slate-950">
+    <header class="flex items-center justify-between gap-3 px-6 py-4 border-b border-slate-800/70">
       <div class="min-w-0">
         <div class="flex items-center gap-2">
-          <h2 class="text-base font-semibold">Asistente de Contrataciones Públicas</h2>
-          <span id="badgeEstricto" class="hidden-x items-center gap-1 bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-400/30 text-[10px] font-semibold rounded-full px-2 py-0.5">🔒 Modo estricto</span>
+          <h2 class="text-base font-semibold text-slate-100">Asistente de contrataciones públicas</h2>
+          <span id="badgeEstricto" class="hidden-x items-center gap-1 bg-emerald-500/10 text-emerald-300 ring-1 ring-emerald-400/20 text-[10px] font-medium rounded-full px-2 py-0.5">🔒 Modo estricto</span>
         </div>
-        <p class="text-xs text-slate-400 truncate">Caso actual: <span id="casoEnChat">— (ninguno)</span></p>
+        <p class="text-xs text-slate-500 truncate mt-0.5">Caso actual: <span id="casoEnChat">— (ninguno)</span></p>
       </div>
-      <button id="btnLimpiar" onclick="limpiarChat()" title="Limpiar chat actual"
-              class="flex items-center gap-1.5 bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium rounded-md px-3 py-2 transition whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed">
-        <span>🧹</span> Limpiar Chat
-      </button>
+      <div class="flex items-center gap-2 flex-none">
+        <button id="btnLimpiar" onclick="limpiarChat()" title="Limpiar chat actual"
+                class="inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed">
+          🧹 Limpiar
+        </button>
+        <button id="btnPanelNormativo" onclick="togglePanelNormativo()" title="Mostrar u ocultar el marco normativo"
+                class="hidden xl:inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition">
+          ⚖️ Marco normativo
+        </button>
+      </div>
     </header>
 
-    <div id="chat" class="flex-1 scroll-y px-6 py-5 space-y-4"></div>
+    <div id="chat" class="flex-1 min-h-0 scroll-y px-6 py-6 space-y-4"></div>
 
-    <div class="border-t border-slate-800 bg-slate-900 px-6 py-3">
-      <!-- FILTROS NORMATIVOS (Busqueda Hibrida) — solo visibles en Consulta General -->
-      <div id="filtrosBar" class="mb-3 flex flex-wrap items-end gap-4" style="display:none">
-        <div class="flex flex-col">
-          <label class="text-[11px] font-semibold text-slate-300 mb-1">Filtros Normativos <span class="text-slate-500 font-normal">(multiselección)</span></label>
-          <select id="filtroCategorias" multiple size="5"
-                  class="bg-slate-800 border border-slate-700 text-slate-100 rounded-md text-xs px-2 py-1 outline-none focus:border-blue-500 min-w-[260px]">
-            <optgroup label="MARCO LEGAL Y REGLAMENTARIO" class="bg-slate-900 text-slate-300">
-              <option value="leyes_y_reglamentos">Leyes y Reglamentos</option>
-            </optgroup>
-            <optgroup label="DIRECTIVAS Y LINEAMIENTOS" class="bg-slate-900 text-slate-300">
-              <option value="directivas">Directivas y lineamientos</option>
-            </optgroup>
-            <optgroup label="HERRAMIENTAS Y FORMATOS ESTÁNDAR" class="bg-slate-900 text-slate-300">
-              <option value="documentos_orientacion">Documentos de orientación / formatos</option>
-            </optgroup>
-            <optgroup label="JURISPRUDENCIA Y CRITERIOS VINCULANTES" class="bg-slate-900 text-slate-300">
-              <option value="resoluciones_tribunal">Resoluciones del Tribunal</option>
-              <option value="opiniones">Opiniones</option>
-            </optgroup>
-          </select>
-          <span class="text-[10px] text-slate-500 mt-1">Sin selección = busca en todas las categorías.</span>
-        </div>
-        <label class="flex items-center gap-1.5 text-xs text-slate-300 pb-1">
-          <input type="checkbox" id="filtroVigente" checked class="w-4 h-4 accent-blue-500">
-          Excluir normativa derogada
-        </label>
-        <div class="flex flex-col">
-          <label class="text-[11px] font-semibold text-slate-300 mb-1">Año de emisión</label>
-          <select id="filtroAnio"
-                  class="bg-slate-800 border border-slate-700 text-slate-100 rounded-md text-xs px-2 py-1.5 outline-none focus:border-blue-500">
-            <option value="Todos">Todos</option>
-            <option value="2026">2026</option>
-            <option value="2025">2025</option>
-            <option value="2024">2024</option>
-            <option value="Anteriores">Anteriores</option>
-          </select>
-        </div>
-        <div class="flex flex-col">
-          <label class="text-[11px] font-semibold text-slate-300 mb-1 flex items-center gap-2">
-            Normas (individual)
-            <span class="font-normal text-slate-500">
-              <button type="button" onclick="marcarNormas(true)" class="text-blue-400 hover:underline">todas</button> /
-              <button type="button" onclick="marcarNormas(false)" class="text-blue-400 hover:underline">ninguna</button>
-            </span>
-          </label>
-          <div id="filtroNormas"
-               class="bg-slate-800 border border-slate-700 rounded-md text-xs px-2 py-1.5 max-h-[120px] min-w-[300px] overflow-y-auto space-y-1">
-            <p class="text-slate-500 text-[10px]">Cargando normas...</p>
-          </div>
-          <span class="text-[10px] text-slate-500 mt-1">Todas activas por defecto; desactiva las que no quieras consultar.</span>
-        </div>
-      </div>
-      <div class="flex items-end gap-2">
+    <!-- Input FIJO abajo (la columna de chat ocupa todo el alto; el chat hace scroll propio) -->
+    <div class="border-t border-slate-800/70 bg-slate-900/60 px-6 py-3">
+      <div class="flex items-end gap-2 max-w-[56rem] mx-auto w-full">
         <textarea id="q" rows="1" placeholder="Entra a un caso para chatear..."
                   class="flex-1 resize-none bg-slate-800 border border-slate-700 text-slate-100 placeholder-slate-500 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 disabled:opacity-50"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();enviar('chat');}"></textarea>
         <button id="btnChat" onclick="enviar('chat')"
                 class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition disabled:opacity-40 disabled:cursor-not-allowed">Enviar</button>
         <button id="btnAnal" onclick="enviar('analisis')"
-                class="bg-amber-600 hover:bg-amber-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed">Ejecutar Análisis Legal</button>
+                class="border border-slate-600 hover:bg-slate-800 text-slate-200 text-sm font-medium rounded-lg px-4 py-2 transition whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed">Análisis legal</button>
       </div>
-      <p id="ayudaChat" class="text-[11px] text-slate-500 mt-1">"Enviar" = pregunta · "Ejecutar Análisis Legal" = auditoría de las fuentes activas guiada por sus etiquetas.</p>
+      <p id="ayudaChat" class="text-[11px] text-slate-500 mt-1.5 max-w-[56rem] mx-auto w-full">"Enviar" = pregunta · "Análisis legal" = auditoría de las fuentes activas guiada por sus etiquetas.</p>
     </div>
   </main>
+
+  <!-- ============ DERECHA: MARCO NORMATIVO (colapsable) ============ -->
+  <aside id="panelNormativo" class="hidden xl:flex w-80 flex-none flex-col bg-slate-900 border-l border-slate-800">
+    <div class="flex items-start justify-between gap-2 px-5 py-4 border-b border-slate-800/70">
+      <div class="min-w-0">
+        <h2 class="text-sm font-semibold text-slate-100">Marco normativo</h2>
+        <p class="text-[11px] text-slate-500 mt-0.5">Filtros y selección de normas para la Consulta General.</p>
+      </div>
+      <button onclick="togglePanelNormativo(false)" title="Ocultar panel"
+              class="flex-none text-slate-500 hover:text-slate-200 text-lg leading-none">&times;</button>
+    </div>
+
+    <div class="flex-1 min-h-0 overflow-y-auto px-5 py-4">
+      <!-- FILTROS NORMATIVOS — solo visibles en Consulta General (lo gobierna marcarModoUI) -->
+      <div id="filtrosBar" class="flex flex-col gap-5" style="display:none">
+
+        <!-- Categoria / Año / Vigencia -->
+        <div class="flex flex-col gap-3">
+          <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-slate-300">Categoría <span class="text-slate-500 font-normal">(multiselección)</span></label>
+            <select id="filtroCategorias" multiple size="5"
+                    class="bg-slate-800 border border-slate-700 text-slate-200 rounded-md text-xs px-2 py-1.5 outline-none focus:border-blue-500">
+              <optgroup label="Marco legal y reglamentario" class="bg-slate-900 text-slate-300">
+                <option value="leyes_y_reglamentos">Leyes y reglamentos</option>
+              </optgroup>
+              <optgroup label="Directivas y lineamientos" class="bg-slate-900 text-slate-300">
+                <option value="directivas">Directivas y lineamientos</option>
+              </optgroup>
+              <optgroup label="Herramientas y formatos estándar" class="bg-slate-900 text-slate-300">
+                <option value="documentos_orientacion">Documentos de orientación / formatos</option>
+              </optgroup>
+              <optgroup label="Jurisprudencia y criterios vinculantes" class="bg-slate-900 text-slate-300">
+                <option value="resoluciones_tribunal">Resoluciones del tribunal</option>
+                <option value="opiniones">Opiniones</option>
+              </optgroup>
+            </select>
+            <span class="text-[10px] text-slate-500">Sin selección = busca en todas las categorías.</span>
+          </div>
+          <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-slate-300">Año de emisión</label>
+            <select id="filtroAnio"
+                    class="bg-slate-800 border border-slate-700 text-slate-200 rounded-md text-xs px-2 py-1.5 outline-none focus:border-blue-500">
+              <option value="Todos">Todos</option>
+              <option value="2026">2026</option>
+              <option value="2025">2025</option>
+              <option value="2024">2024</option>
+              <option value="Anteriores">Anteriores</option>
+            </select>
+          </div>
+          <label class="flex items-center gap-2 text-xs text-slate-300">
+            <input type="checkbox" id="filtroVigente" checked class="w-4 h-4 accent-blue-500">
+            Excluir normativa derogada
+          </label>
+        </div>
+
+        <!-- Normas individuales -->
+        <div class="flex flex-col gap-1.5 border-t border-slate-800/70 pt-4">
+          <div class="flex items-center justify-between">
+            <label class="text-xs font-medium text-slate-300">Normas</label>
+            <span class="text-[11px] text-slate-500">
+              <button type="button" onclick="marcarNormas(true)" class="text-blue-400 hover:underline">todas</button> ·
+              <button type="button" onclick="marcarNormas(false)" class="text-blue-400 hover:underline">ninguna</button>
+            </span>
+          </div>
+          <div id="filtroNormas"
+               class="bg-slate-800/60 border border-slate-700/60 rounded-md text-xs px-2 py-2 max-h-[260px] overflow-y-auto space-y-1.5">
+            <p class="text-slate-500 text-[10px]">Cargando normas...</p>
+          </div>
+          <span class="text-[10px] text-slate-500">Todas activas por defecto; desactiva las que no quieras consultar.</span>
+        </div>
+
+      </div>
+    </div>
+  </aside>
 </div>
 
 <script>
@@ -1350,6 +1382,14 @@ function mostrarVista(vista){
   document.getElementById('vistaCasos').style.display      = (vista === 'repo')       ? 'flex' : 'none';
   document.getElementById('vistaFuentes').style.display    = (vista === 'caso')       ? 'flex' : 'none';
   document.getElementById('vistaBiblioteca').style.display = (vista === 'biblioteca') ? 'flex' : 'none';
+}
+
+// Colapsa/expande el panel derecho "Marco normativo" (responsive-safe via clase).
+function togglePanelNormativo(mostrar){
+  const p = document.getElementById('panelNormativo');
+  if(!p) return;
+  const ocultar = (mostrar === undefined) ? !p.classList.contains('panel-oculto') : !mostrar;
+  p.classList.toggle('panel-oculto', ocultar);
 }
 
 async function fetchConTimeout(url, opts, ms){

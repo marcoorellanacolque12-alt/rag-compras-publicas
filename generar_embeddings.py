@@ -56,8 +56,16 @@ MAX_REINTENTOS = 4
 # ========================================================
 
 
+def _excede_tokens(e):
+    """True si el error es por exceder el limite de tokens por request (no transitorio)."""
+    s = str(e).lower()
+    return ("token count" in s or "reduce the input" in s
+            or ("invalid_argument" in s and "token" in s))
+
+
 def embed_lote(client, textos):
-    """Genera embeddings para una lista de textos, con reintentos."""
+    """Genera embeddings para una lista de textos. Si el lote excede el limite de tokens
+    por request, lo PARTE recursivamente en mitades; otros errores -> reintentos."""
     for intento in range(MAX_REINTENTOS):
         try:
             resp = client.models.embed_content(
@@ -67,6 +75,12 @@ def embed_lote(client, textos):
             )
             return [e.values for e in resp.embeddings]
         except Exception as e:
+            # Lote demasiado grande en tokens -> dividir y reintentar por mitades.
+            if len(textos) > 1 and _excede_tokens(e):
+                mid = len(textos) // 2
+                print(f"   [i] Lote de {len(textos)} excede el limite de tokens; "
+                      f"dividiendo en {mid}+{len(textos)-mid}...")
+                return embed_lote(client, textos[:mid]) + embed_lote(client, textos[mid:])
             espera = 2 ** intento
             print(f"   [!] Error en lote (intento {intento+1}/{MAX_REINTENTOS}): {e}. "
                   f"Reintentando en {espera}s...")

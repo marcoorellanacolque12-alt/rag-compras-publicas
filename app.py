@@ -62,7 +62,7 @@ from responder import (
     recuperar, construir_contexto, cliente, MODELO_GEN,
     GUARDRAIL_CONSULTA_GENERAL,
     embeber_para_indexar, indexar_chunks, eliminar_por_prefijo,
-    con_reintentos, doc_label, listar_normas,
+    con_reintentos, doc_label, listar_normas, formato_cita,
 )
 # Motores de extraccion (en memoria): PDF+OCR, DOCX, Excel/CSV->Markdown, imagen->OCR.
 from extraccion_texto import (
@@ -503,6 +503,9 @@ class Mensaje(BaseModel):
 def _fuentes_normativas(filas):
     return [{
         "documento": doc_label(f["documento"], f.get("chunk_id")),   # etiquetado unificado
+        "cita": formato_cita(f),                                      # cita natural lista para mostrar
+        "tipo_referencia": f.get("tipo_referencia"),
+        "referencia": f.get("referencia"),
         "articulo_num": f["articulo_num"],
         "articulo_titulo": f["articulo_titulo"],
         "relevancia": round(1 - f["distance"], 3),
@@ -1959,7 +1962,7 @@ async function enviar(modo){
     }
     if(d.fuentes_normativas && d.fuentes_normativas.length){
       h += '<div class="mt-1 text-[11px] text-slate-400"><b>Normas cruzadas:</b><br>'
-         + d.fuentes_normativas.map(s=>{ const art = (s.articulo_num!=null && String(s.articulo_num).trim()) ? ', Art. '+esc(String(s.articulo_num)) : ''; return '<span class="inline-block bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1">'+esc(s.documento)+art+'</span>'; }).join('') + '</div>';
+         + d.fuentes_normativas.map(s=>'<span class="inline-block bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1">'+esc(s.cita || s.documento)+'</span>').join('') + '</div>';
     }
     cargando.innerHTML = h;
     if(userTxt) historial.push({rol:'user', texto:userTxt});

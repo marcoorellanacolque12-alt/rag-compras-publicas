@@ -315,8 +315,10 @@ def recuperar(pregunta, k, filtros=None):
     relacion = f"(SELECT * FROM {tabla} WHERE {where})" if where else f"TABLE {tabla}"
 
     sql = f"""
-    SELECT base.chunk_id AS chunk_id, base.documento AS documento, base.articulo_num AS articulo_num,
-           base.articulo_titulo AS articulo_titulo, base.texto AS texto, distance
+    SELECT base.chunk_id AS chunk_id, base.documento AS documento,
+           base.tipo_referencia AS tipo_referencia, base.referencia AS referencia,
+           base.articulo_num AS articulo_num, base.articulo_titulo AS articulo_titulo,
+           base.texto AS texto, distance
     FROM VECTOR_SEARCH(
       {relacion}, 'embedding',
       (SELECT @qemb AS embedding),
@@ -400,15 +402,36 @@ def doc_label(documento, chunk_id=None):
     return d or "Documento"
 
 
+def formato_cita(fila):
+    """Cita NATURAL segun el tipo de referencia (reemplaza el viejo 'Art. X' para todo).
+    Si la fila no tiene tipo_referencia/referencia (corpus aun no recargado), cae al
+    esquema anterior basado en articulo_num."""
+    get = fila.get if hasattr(fila, "get") else (lambda k, d=None: fila[k] if k in fila else d)
+    doc = doc_label(get("documento"), get("chunk_id"))
+    tipo = get("tipo_referencia")
+    ref = get("referencia")
+    if not ref:
+        an = get("articulo_num")
+        return f"{doc}, Art. {an}" if an not in (None, "", "0") else doc
+    if tipo == "articulo":
+        return f"{doc}, Art. {ref}"
+    if tipo == "numeral":
+        return f"{doc}, Numeral {ref}"
+    if tipo == "opinion":
+        return f"Opinión {ref}"
+    if tipo == "considerando":
+        return f"{doc}, {ref}"          # ref ya = 'Fundamento 7' / 'Antecedente 3' / 'Resuelve 1'
+    if tipo == "anexo":
+        return f"{doc}, {ref}"          # ref = 'Anexo 2' / 'Formato 6'
+    return f"{doc}, {ref}"              # seccion u otros
+
+
 def construir_contexto(filas):
-    """Arma el bloque de contexto con los fragmentos numerados."""
+    """Arma el bloque de contexto con los fragmentos numerados y su cita natural."""
     bloques = []
     for i, f in enumerate(filas, start=1):
-        doc = doc_label(f["documento"], f.get("chunk_id"))
         texto = " ".join(f["texto"].split())
-        bloques.append(
-            f"[Fragmento {i}] ({doc}, Art. {f['articulo_num']} - {f['articulo_titulo']})\n{texto}"
-        )
+        bloques.append(f"[Fragmento {i}] ({formato_cita(f)})\n{texto}")
     return "\n\n".join(bloques)
 
 
@@ -456,8 +479,7 @@ def main():
     print(texto)
     print("\n--- FUENTES RECUPERADAS ---")
     for i, f in enumerate(filas, start=1):
-        doc = doc_label(f["documento"], f.get("chunk_id"))
-        print(f"  [{i}] {doc}, Art. {f['articulo_num']}: {f['articulo_titulo']} "
+        print(f"  [{i}] {formato_cita(f)}: {f['articulo_titulo']} "
               f"(coseno {1 - f['distance']:.3f})")
 
 

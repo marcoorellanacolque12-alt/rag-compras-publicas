@@ -122,6 +122,13 @@ os.makedirs(ARCHIVOS_BIBLIOTECA, exist_ok=True)
 MAX_CONTEXT_CHARS = 200_000        # tope de texto de fuentes activas enviado al LLM
 QUERY_DOC_CHARS = 3_000            # extracto para construir la consulta de recuperacion
 MAX_TURNOS_HISTORIAL = 12          # turnos de historial inyectados al modelo
+
+# Instruccion de formato de CITAS (se AÑADE al prompt; no reemplaza el guardrail).
+INSTRUCCION_CITAS = (
+    "FORMATO DE CITAS: tras cada afirmacion, coloca el marcador [N] (por ejemplo [1], [2]) "
+    "del/los fragmento(s) de NORMAS RECUPERADAS que la respaldan. Usa solo numeros de "
+    "fragmentos existentes; no inventes marcadores."
+)
 # ========================================================
 
 
@@ -503,15 +510,20 @@ class Mensaje(BaseModel):
 
 # ============================ HELPERS RAG ============================
 def _fuentes_normativas(filas):
+    # 'numero' = orden 1-based, coincide con [Fragmento N] de construir_contexto y con
+    # los marcadores [N] que el modelo coloca en la respuesta.
     return [{
+        "numero": i,
         "documento": doc_label(f["documento"], f.get("chunk_id")),   # etiquetado unificado
         "cita": formato_cita(f),                                      # cita natural lista para mostrar
         "tipo_referencia": f.get("tipo_referencia"),
         "referencia": f.get("referencia"),
+        "fase": f.get("fase"),
+        "texto": f["texto"],                                          # texto TEXTUAL del fragmento
         "articulo_num": f["articulo_num"],
         "articulo_titulo": f["articulo_titulo"],
         "relevancia": round(1 - f["distance"], 3),
-    } for f in filas]
+    } for i, f in enumerate(filas, start=1)]
 
 
 def _extraer_texto(nombre: str, data: bytes):
@@ -984,6 +996,7 @@ def chat(m: Mensaje):
             GUARDRAIL_CONSULTA_GENERAL + "\n\n"
             "CONTEXTO NORMATIVO PROPORCIONADO (unica fuente de verdad):\n"
             + contexto_normas + "\n\n"
+            + INSTRUCCION_CITAS + "\n\n"
             "CONSULTA DEL USUARIO:\n" + pregunta
         )
         try:
@@ -1038,6 +1051,7 @@ def chat(m: Mensaje):
         sistema = _sistema_chat()
         secciones.append(f"CONSULTA DEL USUARIO:\n{pregunta or '(resume y comenta las fuentes activas)'}")
 
+    secciones.append(INSTRUCCION_CITAS)
     prompt = "\n\n".join(secciones)
 
     # MEMORIA MULTI-TURNO + generacion (helper compartido con la Consulta General).
@@ -1071,18 +1085,80 @@ HTML = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Asistente de Contrataciones Públicas — Repositorio de Casos</title>
+<!-- Tema (claro/oscuro/sistema) ANTES de pintar, para evitar parpadeo -->
+<script>(function(){try{var m=localStorage.getItem('tema')||'sistema';
+  document.documentElement.setAttribute('data-theme',{claro:'light',oscuro:'dark',sistema:'system'}[m]||'system');
+}catch(e){document.documentElement.setAttribute('data-theme','system');}})();</script>
 <script src="https://cdn.tailwindcss.com"></script>
+<script>
+  // RE-SKIN "Grafito y cobre": remapea la paleta de Tailwind a variables CSS (tokens).
+  // Asi todo el markup existente (slate/blue/amber/emerald) toma los colores del tema.
+  tailwind.config = { theme: { extend: { colors: {
+    slate: {
+      50:'rgb(var(--c100)/<alpha-value>)',  100:'rgb(var(--c100)/<alpha-value>)',
+      200:'rgb(var(--c200)/<alpha-value>)', 300:'rgb(var(--c300)/<alpha-value>)',
+      400:'rgb(var(--c400)/<alpha-value>)', 500:'rgb(var(--c500)/<alpha-value>)',
+      600:'rgb(var(--c600)/<alpha-value>)', 700:'rgb(var(--c700)/<alpha-value>)',
+      800:'rgb(var(--c800)/<alpha-value>)', 900:'rgb(var(--c900)/<alpha-value>)',
+      950:'rgb(var(--c950)/<alpha-value>)',
+    },
+    blue:    { 400:'rgb(var(--accent)/<alpha-value>)', 500:'rgb(var(--accent2)/<alpha-value>)', 600:'rgb(var(--accent)/<alpha-value>)' },
+    amber:   { 300:'rgb(var(--accent)/<alpha-value>)', 400:'rgb(var(--accent)/<alpha-value>)', 500:'rgb(var(--accent)/<alpha-value>)', 600:'rgb(var(--accent)/<alpha-value>)' },
+    emerald: { 300:'rgb(var(--c300)/<alpha-value>)', 400:'rgb(var(--c500)/<alpha-value>)', 500:'rgb(var(--c700)/<alpha-value>)' },
+    cobre:   'rgb(var(--accent)/<alpha-value>)',
+  } } } };
+</script>
 <style>
+  /* ====== TOKENS "Grafito y cobre" (canales RGB para soportar opacidades) ====== */
+  :root {                          /* CLARO (derivado; cobre exacto del spec) */
+    --c950:244 243 241; --c900:255 255 255; --c800:236 235 232; --c700:222 219 213;
+    --c600:200 197 190; --c500:122 122 130; --c400:106 106 115; --c300:90 90 98;
+    --c200:45 45 50;    --c100:38 38 42;
+    --accent:180 111 69;  --accent2:156 92 42;   /* #B46F45 / hover */
+    color-scheme: light;
+  }
+  [data-theme="dark"] {            /* OSCURO (valores EXACTOS del spec) */
+    --c950:37 40 42;    --c900:45 49 51;   --c800:54 59 62;   --c700:69 75 80;
+    --c600:90 96 102;   --c500:138 144 153;--c400:162 162 171;--c300:194 196 201;
+    --c200:233 231 227; --c100:240 238 234;
+    --accent:197 123 77;  --accent2:210 145 95;   /* #C57B4D / hover */
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {           /* SISTEMA = sigue al SO */
+    [data-theme="system"] {
+      --c950:37 40 42;    --c900:45 49 51;   --c800:54 59 62;   --c700:69 75 80;
+      --c600:90 96 102;   --c500:138 144 153;--c400:162 162 171;--c300:194 196 201;
+      --c200:233 231 227; --c100:240 238 234;
+      --accent:197 123 77;  --accent2:210 145 95;
+      color-scheme: dark;
+    }
+  }
+  body { transition: background-color .15s ease, color .15s ease; }
   .scroll-y { overflow-y: auto; }
   .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; }
-  .slider { position: absolute; cursor: pointer; inset: 0; background: #cbd5e1; border-radius: 9999px; transition: .2s; }
+  .slider { position: absolute; cursor: pointer; inset: 0; background: rgb(var(--c600)); border-radius: 9999px; transition: .2s; }
   .slider:before { content: ""; position: absolute; height: 16px; width: 16px; left: 3px; top: 3px; background: #fff; border-radius: 9999px; transition: .2s; }
-  input:checked + .slider { background: #2563eb; }
+  input:checked + .slider { background: rgb(var(--accent)); }
   input:checked + .slider:before { transform: translateX(16px); }
   .prosa { white-space: pre-wrap; line-height: 1.6; }
   .hidden-x { display: none; }
-  .panel-oculto { display: none !important; }   /* colapso del panel normativo (responsive-safe) */
+  .panel-oculto { display: none !important; }   /* colapso de paneles laterales (responsive-safe) */
+  /* Selector de tema (segmented) */
+  .tema-btn { cursor: pointer; padding: 4px 7px; border-radius: 6px; line-height: 1; }
+  .tema-btn[aria-pressed="true"] { background: rgb(var(--accent) / 0.18); }
+  /* Citas estilo NotebookLM: marcadores cobre + panel desplegable */
+  .cita-badge { display:inline-flex; align-items:center; justify-content:center; min-width:1.15rem;
+    height:1.15rem; padding:0 .3rem; margin:0 .12rem; font-size:.66rem; font-weight:700; line-height:1;
+    border-radius:.35rem; cursor:pointer; vertical-align:.12em; background:rgb(var(--accent) / 0.16);
+    color:rgb(var(--accent)); border:1px solid rgb(var(--accent) / 0.45); transition:background .15s; }
+  .cita-badge:hover { background:rgb(var(--accent) / 0.30); }
+  .cita-panel { position:fixed; right:1rem; bottom:1rem; width:min(420px, calc(100vw - 2rem));
+    max-height:62vh; overflow-y:auto; background:rgb(var(--c900)); border:1px solid rgb(var(--c700));
+    border-radius:.6rem; box-shadow:0 10px 30px rgb(0 0 0 / .30); z-index:50; }
+  .cita-quote { border-left:3px solid rgb(var(--accent)); padding-left:.7rem; white-space:pre-wrap;
+    line-height:1.55; color:rgb(var(--c200)); }
+  .cita-flash { outline:2px solid rgb(var(--accent)); border-radius:.3rem; transition:outline .3s; }
   /* Mide comoda para el chat: limita el ancho de cada turno y lo centra */
   #chat > div { max-width: 56rem; margin-left: auto; margin-right: auto; width: 100%; }
 </style>
@@ -1090,8 +1166,8 @@ HTML = r"""
 <body class="h-screen bg-slate-950 text-slate-200">
 <div class="flex h-screen">
 
-  <!-- ============ PANEL IZQUIERDO (30%) ============ -->
-  <aside class="w-[30%] min-w-[300px] max-w-[460px] bg-slate-900 border-r border-slate-800 flex flex-col">
+  <!-- ============ PANEL IZQUIERDO (30%) — retractil ============ -->
+  <aside id="panelCasos" class="w-[30%] min-w-[300px] max-w-[460px] bg-slate-900 border-r border-slate-800 flex flex-col">
 
     <!-- VISTA A (vista-repositorio): REPOSITORIO DE CASOS — mutuamente excluyente con #vistaFuentes -->
     <div id="vistaCasos" class="flex flex-col h-full" style="display:flex">
@@ -1103,17 +1179,12 @@ HTML = r"""
       <!-- CONSULTA GENERAL: chat global contra el marco normativo (sin caso) -->
       <div class="px-5 py-4 border-b border-slate-800">
         <button id="btnConsultaGeneral" onclick="entrarConsultaGeneral()"
-                class="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold rounded-md py-2.5 transition ring-1 ring-emerald-400/30">
+                class="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold rounded-md py-2.5 transition ring-1 ring-blue-500/30">
           <span>⚖️</span> Consulta General
         </button>
         <p class="text-[11px] text-slate-500 mt-1.5 flex items-center gap-1">
           <span>🔒</span> Modo estricto: responde solo desde el marco normativo cargado (cero alucinaciones).
         </p>
-        <button id="btnBiblioteca" onclick="entrarBiblioteca()"
-                class="mt-2 w-full flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-slate-100 text-sm font-semibold rounded-md py-2 transition">
-          <span>📚</span> Biblioteca Institucional
-        </button>
-        <p class="text-[11px] text-slate-500 mt-1.5">Sube normativa global (se vectoriza con su categoría, año y vigencia para la búsqueda híbrida).</p>
       </div>
 
       <div class="px-5 py-4 border-b border-slate-800">
@@ -1251,6 +1322,10 @@ HTML = r"""
         <p class="text-xs text-slate-500 truncate mt-0.5">Caso actual: <span id="casoEnChat">— (ninguno)</span></p>
       </div>
       <div class="flex items-center gap-2 flex-none">
+        <button id="btnPanelCasos" onclick="togglePanelCasos()" title="Mostrar u ocultar Mis casos"
+                class="inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition">
+          ☰ Casos
+        </button>
         <button id="btnLimpiar" onclick="limpiarChat()" title="Limpiar chat actual"
                 class="inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed">
           🧹 Limpiar
@@ -1259,6 +1334,11 @@ HTML = r"""
                 class="hidden xl:inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition">
           ⚖️ Marco normativo
         </button>
+        <div role="group" aria-label="Apariencia" class="inline-flex items-center gap-0.5 border border-slate-700 rounded-md px-1 py-0.5 text-slate-300 text-sm">
+          <button class="tema-btn" data-tema="claro" onclick="setTema('claro')" title="Claro" aria-pressed="false">☀️</button>
+          <button class="tema-btn" data-tema="sistema" onclick="setTema('sistema')" title="Sistema" aria-pressed="false">🖥️</button>
+          <button class="tema-btn" data-tema="oscuro" onclick="setTema('oscuro')" title="Oscuro" aria-pressed="false">🌙</button>
+        </div>
       </div>
     </header>
 
@@ -1291,6 +1371,13 @@ HTML = r"""
     </div>
 
     <div class="flex-1 min-h-0 overflow-y-auto px-5 py-4">
+      <!-- Biblioteca Institucional (movida desde Mis casos al panel derecho) -->
+      <button id="btnBiblioteca" onclick="entrarBiblioteca()"
+              class="w-full flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-slate-100 text-sm font-semibold rounded-md py-2 transition">
+        <span>📚</span> Biblioteca Institucional
+      </button>
+      <p class="text-[11px] text-slate-500 mt-1.5 mb-4">Sube normativa global (se vectoriza con su categoría, año y vigencia para la búsqueda híbrida).</p>
+
       <!-- FILTROS NORMATIVOS — solo visibles en Consulta General (lo gobierna marcarModoUI) -->
       <div id="filtrosBar" class="flex flex-col gap-5" style="display:none">
 
@@ -1352,6 +1439,23 @@ HTML = r"""
       </div>
     </div>
   </aside>
+
+  <!-- PANEL DE CITA (estilo NotebookLM): texto textual del fragmento citado -->
+  <div id="citaPanel" class="cita-panel hidden-x">
+    <div class="flex items-start justify-between gap-2 px-4 py-3 border-b border-slate-700">
+      <div class="min-w-0">
+        <div id="citaRef" class="text-xs font-semibold text-slate-100 truncate">—</div>
+        <div id="citaMeta" class="text-[11px] text-slate-500 mt-0.5"></div>
+      </div>
+      <button onclick="cerrarCita()" title="Cerrar" class="flex-none text-slate-500 hover:text-slate-200 text-lg leading-none">&times;</button>
+    </div>
+    <div class="px-4 py-3">
+      <div id="citaTexto" class="cita-quote text-xs"></div>
+      <div class="mt-3 text-right">
+        <button id="citaFuente" onclick="verFuenteCita()" class="text-[11px] text-blue-400 hover:underline">ver fuente →</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1361,6 +1465,10 @@ let fuentes = [];        // fuentes del caso actual
 let historial = [];      // memoria multi-turno del caso/consulta actual
 const tags = [];
 const MAX_HIST_CLIENTE = 40;
+// Citas (estilo NotebookLM): mapa cid -> fragmento, para abrir el texto al clic.
+let _citas = {};
+let _msgSeq = 0;
+let _citaActual = null;
 
 // ===== ARQUITECTURA MULTITAREA: estado global desacoplado de la vista activa =====
 const seleccion = new Set();   // caso_ids marcados para borrado masivo
@@ -1404,6 +1512,65 @@ function togglePanelNormativo(mostrar){
   const ocultar = (mostrar === undefined) ? !p.classList.contains('panel-oculto') : !mostrar;
   p.classList.toggle('panel-oculto', ocultar);
 }
+// Columna izquierda "Mis casos" retractil (mismo patron que el panel derecho).
+function togglePanelCasos(mostrar){
+  const p = document.getElementById('panelCasos');
+  if(!p) return;
+  const ocultar = (mostrar === undefined) ? !p.classList.contains('panel-oculto') : !mostrar;
+  p.classList.toggle('panel-oculto', ocultar);
+}
+// ===== TEMA: claro / oscuro / sistema (persistente) =====
+function setTema(modo){
+  const dt = {claro:'light', oscuro:'dark', sistema:'system'}[modo] || 'system';
+  document.documentElement.setAttribute('data-theme', dt);
+  try { localStorage.setItem('tema', modo); } catch(e) {}
+  document.querySelectorAll('.tema-btn').forEach(b =>
+    b.setAttribute('aria-pressed', b.dataset.tema === modo ? 'true' : 'false'));
+}
+function initTema(){
+  let modo = 'sistema';
+  try { modo = localStorage.getItem('tema') || 'sistema'; } catch(e) {}
+  setTema(modo);
+}
+
+// ===== CITAS desplegables (estilo NotebookLM) =====
+function etiquetaTipo(t){
+  return ({articulo:'Art.', numeral:'Numeral', opinion:'Opinión', considerando:'Considerando',
+           anexo:'Anexo', seccion:'Sección', preambulo:'Preámbulo'})[t] || (t || '');
+}
+function abrirCita(cid){
+  const fr = _citas[cid]; if(!fr) return;
+  _citaActual = fr;
+  document.getElementById('citaRef').textContent = fr.documento || 'Fuente';
+  const refTxt = fr.tipo_referencia
+      ? (etiquetaTipo(fr.tipo_referencia) + (fr.referencia ? (' ' + fr.referencia) : ''))
+      : (fr.cita || '');
+  document.getElementById('citaMeta').textContent =
+      [refTxt, fr.fase ? ('fase: ' + fr.fase) : ''].filter(Boolean).join('  ·  ');
+  document.getElementById('citaTexto').textContent = fr.texto || '(sin texto del fragmento)';
+  document.getElementById('citaPanel').classList.remove('hidden-x');
+}
+function cerrarCita(){ document.getElementById('citaPanel').classList.add('hidden-x'); }
+function verFuenteCita(){
+  if(!_citaActual) return;
+  togglePanelNormativo(true);                       // asegura visible el panel derecho
+  const cont = document.getElementById('filtroNormas');
+  const objetivo = (_citaActual.documento || '').trim().toLowerCase();
+  if(cont && objetivo){
+    for(const l of cont.querySelectorAll('label')){
+      if(l.textContent.trim().toLowerCase().includes(objetivo)){
+        l.scrollIntoView({block:'center', behavior:'smooth'});
+        l.classList.add('cita-flash'); setTimeout(()=>l.classList.remove('cita-flash'), 1500);
+        break;
+      }
+    }
+  }
+}
+// Delegacion: cualquier elemento con data-cid (badge inline o chip) abre su cita.
+document.addEventListener('click', function(e){
+  const b = e.target.closest('[data-cid]');
+  if(b && b.dataset.cid) abrirCita(b.dataset.cid);
+});
 
 async function fetchConTimeout(url, opts, ms){
   const ctrl = new AbortController();
@@ -1965,14 +2132,23 @@ async function enviar(modo){
     let d = {}; try { d = await r.json(); } catch(_){ d = {}; }
     if(!r.ok){ cargando.innerHTML = '<span class="text-amber-700">Error '+r.status+': '+esc(d.error||'fallo del servidor')+'</span>'; return; }
     if(d.error){ cargando.innerHTML = '<span class="text-amber-700">'+esc(d.error)+'</span>'; return; }
+    _msgSeq++;
+    const _frags = d.fuentes_normativas || [];
     let h = esc(d.respuesta || 'Sin respuesta.');
+    // Marcadores [N] -> badge cobre clicable (split/join: sin regex ni escapes).
+    _frags.forEach(fr => {
+      if(fr.numero == null) return;
+      const cid = _msgSeq + '_' + fr.numero; _citas[cid] = fr;
+      const badge = '<button type="button" class="cita-badge" data-cid="'+cid+'" title="Ver fuente">'+fr.numero+'</button>';
+      h = h.split('['+fr.numero+']').join(badge);
+    });
     if(d.fuentes_usadas && d.fuentes_usadas.length){
       h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes del caso usadas:</b> '
          + d.fuentes_usadas.map(x=>esc(x.nombre)).join(', ') + '</div>';
     }
-    if(d.fuentes_normativas && d.fuentes_normativas.length){
-      h += '<div class="mt-1 text-[11px] text-slate-400"><b>Normas cruzadas:</b><br>'
-         + d.fuentes_normativas.map(s=>'<span class="inline-block bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1">'+esc(s.cita || s.documento)+'</span>').join('') + '</div>';
+    if(_frags.length){
+      h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes citadas:</b><br>'
+         + _frags.map(s=>'<button type="button" data-cid="'+(_msgSeq+'_'+s.numero)+'" class="inline-flex items-center gap-1 bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1 hover:border-blue-500 transition"><span class="cita-badge">'+s.numero+'</span>'+esc(s.cita || s.documento)+'</button>').join('') + '</div>';
     }
     cargando.innerHTML = h;
     if(userTxt) historial.push({rol:'user', texto:userTxt});
@@ -1986,6 +2162,7 @@ async function enviar(modo){
 }
 
 // =================== INIT ===================
+initTema();             // aplica tema guardado (claro/oscuro/sistema) y marca el boton activo
 mostrarVista('repo');   // estado inicial: vista-repositorio visible, detalle-caso oculto
 setChat(false); marcarModoUI();
 resetChatUI('Bienvenido. Usa <b>Consulta General</b> 🔒 para preguntar sobre el marco normativo, o entra a un caso para trabajar con tus propios documentos.');

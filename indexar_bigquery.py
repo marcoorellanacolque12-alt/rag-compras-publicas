@@ -13,9 +13,9 @@ Ventajas frente a Vertex AI Vector Search:
   - Escala a millones de chunks.
 
 Tabla resultante: <project>.rag_compras.chunks_embeddings
-  columnas: chunk_id, categoria, documento, articulo_num,
-            articulo_titulo, parte, n_chars, texto,
-            embedding (ARRAY<FLOAT64>)
+  columnas: chunk_id, categoria, documento, tipo_referencia, referencia,
+            articulo_num, articulo_titulo, parte, n_chars, texto,
+            fase, emisor, anio, vigente, embedding (ARRAY<FLOAT64>)
 
 Requisitos:
     pip install google-cloud-storage google-cloud-bigquery
@@ -45,12 +45,18 @@ SCHEMA = [
     bigquery.SchemaField("chunk_id", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("categoria", "STRING"),
     bigquery.SchemaField("documento", "STRING"),
+    # Referencia GENERAL (troceo consciente del tipo): reemplaza el viejo "Art. 0".
+    bigquery.SchemaField("tipo_referencia", "STRING"),   # articulo|numeral|seccion|opinion|considerando|anexo|preambulo
+    bigquery.SchemaField("referencia", "STRING"),        # "45" | "5.2" | "D013-2025-OECE-DTN" | "Fundamento 7" ...
+    # Espejo de transicion (compatibilidad con el esquema actual).
     bigquery.SchemaField("articulo_num", "STRING"),
     bigquery.SchemaField("articulo_titulo", "STRING"),
     bigquery.SchemaField("parte", "INTEGER"),
     bigquery.SchemaField("n_chars", "INTEGER"),
     bigquery.SchemaField("texto", "STRING"),
-    # Metadatos para BUSQUEDA HIBRIDA (pre-filtering): se inyectan junto al embedding.
+    # Metadatos para BUSQUEDA HIBRIDA (pre-filtering) y cita.
+    bigquery.SchemaField("fase", "STRING"),        # actuaciones_preparatorias|seleccion|ejecucion_contractual|transversal
+    bigquery.SchemaField("emisor", "STRING"),      # dato de cita (no filtro)
     bigquery.SchemaField("anio", "INTEGER"),       # ano de emision del documento
     bigquery.SchemaField("vigente", "BOOLEAN"),    # True = vigente; False = derogada
     bigquery.SchemaField("embedding", "FLOAT64", mode="REPEATED"),
@@ -113,11 +119,15 @@ def main():
             "chunk_id": cid,
             "categoria": c.get("categoria"),
             "documento": c.get("documento"),
-            "articulo_num": c.get("articulo_num"),
+            "tipo_referencia": c.get("tipo_referencia"),   # troceo consciente del tipo
+            "referencia": c.get("referencia"),
+            "articulo_num": c.get("articulo_num"),          # espejo de transicion
             "articulo_titulo": c.get("articulo_titulo"),
             "parte": c.get("parte"),
             "n_chars": c.get("n_chars"),
             "texto": c.get("texto"),
+            "fase": c.get("fase"),                 # pre-filtering por fase
+            "emisor": c.get("emisor"),             # dato de cita
             "anio": c.get("anio"),                 # metadato para pre-filtering
             "vigente": c.get("vigente", True),     # por defecto: vigente
             "embedding": vects[cid],

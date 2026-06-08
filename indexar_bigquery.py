@@ -32,6 +32,7 @@ Uso:
 """
 
 import json
+import argparse
 from google.cloud import storage, bigquery
 
 # ===================== CONFIGURACION =====================
@@ -68,10 +69,11 @@ SCHEMA = [
 ]
 
 
-def cargar_metadatos(storage_client):
-    """id -> dict de metadatos (de chunks/)."""
+def cargar_metadatos(storage_client, solo=None):
+    """id -> dict de metadatos (de chunks/, opcionalmente filtrado por categoria)."""
+    prefijo = f"{PREFIJO_CHUNKS}/{solo}/" if solo else f"{PREFIJO_CHUNKS}/"
     meta = {}
-    for blob in storage_client.list_blobs(BUCKET_NAME, prefix=f"{PREFIJO_CHUNKS}/"):
+    for blob in storage_client.list_blobs(BUCKET_NAME, prefix=prefijo):
         if not blob.name.endswith(".jsonl"):
             continue
         for linea in blob.download_as_text().splitlines():
@@ -81,10 +83,11 @@ def cargar_metadatos(storage_client):
     return meta
 
 
-def cargar_embeddings(storage_client):
-    """id -> vector (de embeddings/)."""
+def cargar_embeddings(storage_client, solo=None):
+    """id -> vector (de embeddings/, opcionalmente filtrado por categoria)."""
+    prefijo = f"{PREFIJO_EMB}/{solo}/" if solo else f"{PREFIJO_EMB}/"
     vects = {}
-    for blob in storage_client.list_blobs(BUCKET_NAME, prefix=f"{PREFIJO_EMB}/"):
+    for blob in storage_client.list_blobs(BUCKET_NAME, prefix=prefijo):
         if not blob.name.endswith(".json"):
             continue
         for linea in blob.download_as_text().splitlines():
@@ -95,9 +98,15 @@ def cargar_embeddings(storage_client):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Indexa chunks+embeddings en BigQuery (incremental).")
+    parser.add_argument("--solo", default=None, help="Filtra por categoria (ej: directivas).")
+    args = parser.parse_args()
+
     print("=" * 60)
     print(" FASE 4 RAG - INDEXACION EN BIGQUERY (sin costo fijo)")
     print("=" * 60)
+    if args.solo:
+        print(f"Filtro: solo '{args.solo}/'")
 
     storage_client = storage.Client(project=PROJECT_ID)
     bq = bigquery.Client(project=PROJECT_ID)
@@ -108,10 +117,10 @@ def main():
     bq.create_dataset(ds_ref, exists_ok=True)
     print(f"[OK] Dataset listo: {PROJECT_ID}.{DATASET} ({LOCATION})")
 
-    # 2) Unir metadatos + vectores por id.
+    # 2) Unir metadatos + vectores por id (acotado por --solo si se indica).
     print("-> Cargando chunks y embeddings desde GCS...")
-    meta = cargar_metadatos(storage_client)
-    vects = cargar_embeddings(storage_client)
+    meta = cargar_metadatos(storage_client, args.solo)
+    vects = cargar_embeddings(storage_client, args.solo)
     print(f"   chunks: {len(meta)} | vectores: {len(vects)}")
 
     filas = []

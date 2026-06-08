@@ -7,6 +7,11 @@ Carga los chunks (metadatos, de 'chunks/') junto con sus vectores
 (de 'embeddings/') en una tabla de BigQuery, lista para busqueda
 semantica con la funcion VECTOR_SEARCH.
 
+Carga INCREMENTAL e IDEMPOTENTE (WRITE_APPEND): antes de insertar borra los
+chunks previos del corpus para los documentos del lote (clave = `documento`),
+sin tocar las directivas de la Biblioteca web (chunk_id 'bib_*'). Permite cargar
+por lotes (--solo <categoria>) y re-cargar un documento sin duplicar.
+
 Ventajas frente a Vertex AI Vector Search:
   - Serverless: NO hay endpoint 24/7 -> sin costo fijo.
   - Solo pagas almacenamiento (centavos) y bytes por consulta.
@@ -135,21 +140,38 @@ def main():
     if sin_vector:
         print(f"   [!] {sin_vector} chunks sin vector (omitidos).")
 
-    # 3) Cargar a BigQuery (reemplaza la tabla).
+    if not filas:
+        print("   [!] No hay chunks para cargar. Nada que hacer.")
+        return
+
     tabla_id = f"{PROJECT_ID}.{DATASET}.{TABLA}"
+
+    # 3a) DEDUP idempotente: borra los chunks PREVIOS del corpus para los documentos
+    #     de este lote (clave = documento), SIN tocar las directivas de la Biblioteca web
+    #     (chunk_id 'bib_*'). Asi re-cargar un documento lo reemplaza limpio, sin duplicar.
+    docs_lote = sorted({f["documento"] for f in filas if f.get("documento")})
+    if docs_lote:
+        del_sql = (f"DELETE FROM `{tabla_id}` "
+                   f"WHERE documento IN UNNEST(@docs) AND NOT STARTS_WITH(chunk_id, 'bib_')")
+        del_cfg = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("docs", "STRING", docs_lote)])
+        print(f"-> Dedup: borrando chunks previos de {len(docs_lote)} documento(s) del corpus...")
+        bq.query(del_sql, job_config=del_cfg, location=LOCATION).result()
+
+    # 3b) Cargar (WRITE_APPEND -> carga incremental por lotes, no borra lo anterior).
     job_config = bigquery.LoadJobConfig(
         schema=SCHEMA,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
     )
-    print(f"-> Cargando {len(filas)} filas en {tabla_id} ...")
+    print(f"-> Cargando {len(filas)} filas (APPEND) en {tabla_id} ...")
     job = bq.load_table_from_json(filas, tabla_id, job_config=job_config)
     job.result()  # espera
 
     tabla = bq.get_table(tabla_id)
     print("\n" + "=" * 60)
-    print(f" [OK] Tabla cargada: {tabla_id}")
-    print(f"      Filas: {tabla.num_rows} | Tamano: {tabla.num_bytes/1024/1024:.2f} MB")
-    print("      Lista para consultas con VECTOR_SEARCH (ver buscar.py).")
+    print(f" [OK] Lote cargado: {len(filas)} filas | {len(docs_lote)} documento(s) reemplazado(s).")
+    print(f"      Tabla {tabla_id}: {tabla.num_rows} filas | {tabla.num_bytes/1024/1024:.2f} MB")
+    print("      Carga INCREMENTAL idempotente (WRITE_APPEND + dedup por documento).")
     print("=" * 60)
 
 

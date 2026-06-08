@@ -23,6 +23,7 @@
 !indexar_bigquery.py
 !buscar.py
 !responder.py
+!reset_corpus.py
 
 # Aplicacion web (API + UI) y despliegue
 !app.py

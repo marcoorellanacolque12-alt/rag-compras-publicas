@@ -122,6 +122,13 @@ os.makedirs(ARCHIVOS_BIBLIOTECA, exist_ok=True)
 MAX_CONTEXT_CHARS = 200_000        # tope de texto de fuentes activas enviado al LLM
 QUERY_DOC_CHARS = 3_000            # extracto para construir la consulta de recuperacion
 MAX_TURNOS_HISTORIAL = 12          # turnos de historial inyectados al modelo
+
+# Instruccion de formato de CITAS (se AÑADE al prompt; no reemplaza el guardrail).
+INSTRUCCION_CITAS = (
+    "FORMATO DE CITAS: tras cada afirmacion, coloca el marcador [N] (por ejemplo [1], [2]) "
+    "del/los fragmento(s) de NORMAS RECUPERADAS que la respaldan. Usa solo numeros de "
+    "fragmentos existentes; no inventes marcadores."
+)
 # ========================================================
 
 
@@ -503,15 +510,20 @@ class Mensaje(BaseModel):
 
 # ============================ HELPERS RAG ============================
 def _fuentes_normativas(filas):
+    # 'numero' = orden 1-based, coincide con [Fragmento N] de construir_contexto y con
+    # los marcadores [N] que el modelo coloca en la respuesta.
     return [{
+        "numero": i,
         "documento": doc_label(f["documento"], f.get("chunk_id")),   # etiquetado unificado
         "cita": formato_cita(f),                                      # cita natural lista para mostrar
         "tipo_referencia": f.get("tipo_referencia"),
         "referencia": f.get("referencia"),
+        "fase": f.get("fase"),
+        "texto": f["texto"],                                          # texto TEXTUAL del fragmento
         "articulo_num": f["articulo_num"],
         "articulo_titulo": f["articulo_titulo"],
         "relevancia": round(1 - f["distance"], 3),
-    } for f in filas]
+    } for i, f in enumerate(filas, start=1)]
 
 
 def _extraer_texto(nombre: str, data: bytes):
@@ -984,6 +996,7 @@ def chat(m: Mensaje):
             GUARDRAIL_CONSULTA_GENERAL + "\n\n"
             "CONTEXTO NORMATIVO PROPORCIONADO (unica fuente de verdad):\n"
             + contexto_normas + "\n\n"
+            + INSTRUCCION_CITAS + "\n\n"
             "CONSULTA DEL USUARIO:\n" + pregunta
         )
         try:
@@ -1038,6 +1051,7 @@ def chat(m: Mensaje):
         sistema = _sistema_chat()
         secciones.append(f"CONSULTA DEL USUARIO:\n{pregunta or '(resume y comenta las fuentes activas)'}")
 
+    secciones.append(INSTRUCCION_CITAS)
     prompt = "\n\n".join(secciones)
 
     # MEMORIA MULTI-TURNO + generacion (helper compartido con la Consulta General).
@@ -1133,6 +1147,18 @@ HTML = r"""
   /* Selector de tema (segmented) */
   .tema-btn { cursor: pointer; padding: 4px 7px; border-radius: 6px; line-height: 1; }
   .tema-btn[aria-pressed="true"] { background: rgb(var(--accent) / 0.18); }
+  /* Citas estilo NotebookLM: marcadores cobre + panel desplegable */
+  .cita-badge { display:inline-flex; align-items:center; justify-content:center; min-width:1.15rem;
+    height:1.15rem; padding:0 .3rem; margin:0 .12rem; font-size:.66rem; font-weight:700; line-height:1;
+    border-radius:.35rem; cursor:pointer; vertical-align:.12em; background:rgb(var(--accent) / 0.16);
+    color:rgb(var(--accent)); border:1px solid rgb(var(--accent) / 0.45); transition:background .15s; }
+  .cita-badge:hover { background:rgb(var(--accent) / 0.30); }
+  .cita-panel { position:fixed; right:1rem; bottom:1rem; width:min(420px, calc(100vw - 2rem));
+    max-height:62vh; overflow-y:auto; background:rgb(var(--c900)); border:1px solid rgb(var(--c700));
+    border-radius:.6rem; box-shadow:0 10px 30px rgb(0 0 0 / .30); z-index:50; }
+  .cita-quote { border-left:3px solid rgb(var(--accent)); padding-left:.7rem; white-space:pre-wrap;
+    line-height:1.55; color:rgb(var(--c200)); }
+  .cita-flash { outline:2px solid rgb(var(--accent)); border-radius:.3rem; transition:outline .3s; }
   /* Mide comoda para el chat: limita el ancho de cada turno y lo centra */
   #chat > div { max-width: 56rem; margin-left: auto; margin-right: auto; width: 100%; }
 </style>
@@ -1413,6 +1439,23 @@ HTML = r"""
       </div>
     </div>
   </aside>
+
+  <!-- PANEL DE CITA (estilo NotebookLM): texto textual del fragmento citado -->
+  <div id="citaPanel" class="cita-panel hidden-x">
+    <div class="flex items-start justify-between gap-2 px-4 py-3 border-b border-slate-700">
+      <div class="min-w-0">
+        <div id="citaRef" class="text-xs font-semibold text-slate-100 truncate">—</div>
+        <div id="citaMeta" class="text-[11px] text-slate-500 mt-0.5"></div>
+      </div>
+      <button onclick="cerrarCita()" title="Cerrar" class="flex-none text-slate-500 hover:text-slate-200 text-lg leading-none">&times;</button>
+    </div>
+    <div class="px-4 py-3">
+      <div id="citaTexto" class="cita-quote text-xs"></div>
+      <div class="mt-3 text-right">
+        <button id="citaFuente" onclick="verFuenteCita()" class="text-[11px] text-blue-400 hover:underline">ver fuente →</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1422,6 +1465,10 @@ let fuentes = [];        // fuentes del caso actual
 let historial = [];      // memoria multi-turno del caso/consulta actual
 const tags = [];
 const MAX_HIST_CLIENTE = 40;
+// Citas (estilo NotebookLM): mapa cid -> fragmento, para abrir el texto al clic.
+let _citas = {};
+let _msgSeq = 0;
+let _citaActual = null;
 
 // ===== ARQUITECTURA MULTITAREA: estado global desacoplado de la vista activa =====
 const seleccion = new Set();   // caso_ids marcados para borrado masivo
@@ -1485,6 +1532,45 @@ function initTema(){
   try { modo = localStorage.getItem('tema') || 'sistema'; } catch(e) {}
   setTema(modo);
 }
+
+// ===== CITAS desplegables (estilo NotebookLM) =====
+function etiquetaTipo(t){
+  return ({articulo:'Art.', numeral:'Numeral', opinion:'Opinión', considerando:'Considerando',
+           anexo:'Anexo', seccion:'Sección', preambulo:'Preámbulo'})[t] || (t || '');
+}
+function abrirCita(cid){
+  const fr = _citas[cid]; if(!fr) return;
+  _citaActual = fr;
+  document.getElementById('citaRef').textContent = fr.documento || 'Fuente';
+  const refTxt = fr.tipo_referencia
+      ? (etiquetaTipo(fr.tipo_referencia) + (fr.referencia ? (' ' + fr.referencia) : ''))
+      : (fr.cita || '');
+  document.getElementById('citaMeta').textContent =
+      [refTxt, fr.fase ? ('fase: ' + fr.fase) : ''].filter(Boolean).join('  ·  ');
+  document.getElementById('citaTexto').textContent = fr.texto || '(sin texto del fragmento)';
+  document.getElementById('citaPanel').classList.remove('hidden-x');
+}
+function cerrarCita(){ document.getElementById('citaPanel').classList.add('hidden-x'); }
+function verFuenteCita(){
+  if(!_citaActual) return;
+  togglePanelNormativo(true);                       // asegura visible el panel derecho
+  const cont = document.getElementById('filtroNormas');
+  const objetivo = (_citaActual.documento || '').trim().toLowerCase();
+  if(cont && objetivo){
+    for(const l of cont.querySelectorAll('label')){
+      if(l.textContent.trim().toLowerCase().includes(objetivo)){
+        l.scrollIntoView({block:'center', behavior:'smooth'});
+        l.classList.add('cita-flash'); setTimeout(()=>l.classList.remove('cita-flash'), 1500);
+        break;
+      }
+    }
+  }
+}
+// Delegacion: cualquier elemento con data-cid (badge inline o chip) abre su cita.
+document.addEventListener('click', function(e){
+  const b = e.target.closest('[data-cid]');
+  if(b && b.dataset.cid) abrirCita(b.dataset.cid);
+});
 
 async function fetchConTimeout(url, opts, ms){
   const ctrl = new AbortController();
@@ -2046,14 +2132,23 @@ async function enviar(modo){
     let d = {}; try { d = await r.json(); } catch(_){ d = {}; }
     if(!r.ok){ cargando.innerHTML = '<span class="text-amber-700">Error '+r.status+': '+esc(d.error||'fallo del servidor')+'</span>'; return; }
     if(d.error){ cargando.innerHTML = '<span class="text-amber-700">'+esc(d.error)+'</span>'; return; }
+    _msgSeq++;
+    const _frags = d.fuentes_normativas || [];
     let h = esc(d.respuesta || 'Sin respuesta.');
+    // Marcadores [N] -> badge cobre clicable (split/join: sin regex ni escapes).
+    _frags.forEach(fr => {
+      if(fr.numero == null) return;
+      const cid = _msgSeq + '_' + fr.numero; _citas[cid] = fr;
+      const badge = '<button type="button" class="cita-badge" data-cid="'+cid+'" title="Ver fuente">'+fr.numero+'</button>';
+      h = h.split('['+fr.numero+']').join(badge);
+    });
     if(d.fuentes_usadas && d.fuentes_usadas.length){
       h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes del caso usadas:</b> '
          + d.fuentes_usadas.map(x=>esc(x.nombre)).join(', ') + '</div>';
     }
-    if(d.fuentes_normativas && d.fuentes_normativas.length){
-      h += '<div class="mt-1 text-[11px] text-slate-400"><b>Normas cruzadas:</b><br>'
-         + d.fuentes_normativas.map(s=>'<span class="inline-block bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1">'+esc(s.cita || s.documento)+'</span>').join('') + '</div>';
+    if(_frags.length){
+      h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes citadas:</b><br>'
+         + _frags.map(s=>'<button type="button" data-cid="'+(_msgSeq+'_'+s.numero)+'" class="inline-flex items-center gap-1 bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1 hover:border-blue-500 transition"><span class="cita-badge">'+s.numero+'</span>'+esc(s.cita || s.documento)+'</button>').join('') + '</div>';
     }
     cargando.innerHTML = h;
     if(userTxt) historial.push({rol:'user', texto:userTxt});

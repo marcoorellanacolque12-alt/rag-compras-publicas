@@ -317,6 +317,7 @@ def recuperar(pregunta, k, filtros=None):
     sql = f"""
     SELECT base.chunk_id AS chunk_id, base.documento AS documento,
            base.tipo_referencia AS tipo_referencia, base.referencia AS referencia,
+           base.fase AS fase,
            base.articulo_num AS articulo_num, base.articulo_titulo AS articulo_titulo,
            base.texto AS texto, distance
     FROM VECTOR_SEARCH(

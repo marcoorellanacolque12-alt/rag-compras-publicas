@@ -19,9 +19,15 @@ Requisitos:
     pip install google-cloud-storage google-genai
     Autenticacion ADC + API de Vertex AI habilitada.
 
+INCREMENTAL: salta los documentos ya embebidos (mismo conjunto de chunk_id en
+'embeddings/'), para cargar por categoria y retomar lotes interrumpidos sin
+re-pagar ni duplicar. Re-embebe solo lo nuevo o lo re-chunkeado. Con --rehacer
+fuerza re-embeber todo.
+
 Uso:
     python generar_embeddings.py
     python generar_embeddings.py --solo leyes_y_reglamentos
+    python generar_embeddings.py --solo directivas --rehacer
 -------------------------------------------------------------------
 """
 
@@ -71,6 +77,8 @@ def embed_lote(client, textos):
 def main():
     parser = argparse.ArgumentParser(description="Genera embeddings de los chunks en GCS.")
     parser.add_argument("--solo", default=None, help="Filtra por categoria (ej: leyes_y_reglamentos).")
+    parser.add_argument("--rehacer", action="store_true",
+                        help="Re-embebe TODO aunque ya exista (ignora el salto incremental).")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -81,10 +89,19 @@ def main():
     storage_client = storage.Client(project=PROJECT_ID)
     genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 
-    prefijo = f"{PREFIJO_ENTRADA}/{args.solo}/" if args.solo else f"{PREFIJO_ENTRADA}/"
+    sub = f"{args.solo}/" if args.solo else ""
+    prefijo = f"{PREFIJO_ENTRADA}/{sub}"
+
+    # INCREMENTAL: pre-listar los embeddings ya generados (1 sola llamada) para saltar
+    # los documentos que ya estan completos y NO re-pagar.
+    existentes = {b.name: b for b in storage_client.list_blobs(BUCKET_NAME, prefix=f"{PREFIJO_SALIDA}/{sub}")
+                  if b.name.endswith(".json")}
+    if args.rehacer:
+        print("[modo --rehacer] se re-embebera todo, ignorando lo existente.\n")
 
     total_vectores = 0
     total_docs = 0
+    omitidos = 0
 
     for blob in storage_client.list_blobs(BUCKET_NAME, prefix=prefijo):
         if not blob.name.endswith(".jsonl"):
@@ -96,7 +113,24 @@ def main():
 
         documento = chunks[0]["documento"]
         categoria = chunks[0]["categoria"]
-        print(f"-> Embeddings: {documento} ({len(chunks)} chunks)")
+        salida = f"{PREFIJO_SALIDA}/{categoria}/{documento}.json"
+
+        # Salto incremental: si ya existe el embedding con EXACTAMENTE los mismos chunk_id,
+        # esta completo -> no re-procesar. Si difieren (re-chunkeo) o falta -> (re)generar.
+        if not args.rehacer and salida in existentes:
+            ids_in = {c["chunk_id"] for c in chunks}
+            try:
+                ids_out = {json.loads(l)["id"]
+                           for l in existentes[salida].download_as_text().splitlines() if l.strip()}
+            except Exception:
+                ids_out = set()
+            if ids_out == ids_in:
+                print(f"-> SKIP (ya embebido, {len(chunks)} chunks): {documento}")
+                omitidos += 1
+                continue
+            print(f"-> RE-EMBED (cambiaron los chunks): {documento} ({len(chunks)} chunks)")
+        else:
+            print(f"-> Embeddings: {documento} ({len(chunks)} chunks)")
 
         lineas_salida = []
         for i in range(0, len(chunks), BATCH_SIZE):
@@ -124,7 +158,8 @@ def main():
         total_docs += 1
 
     print("\n" + "=" * 60)
-    print(f" FINALIZADO. Documentos: {total_docs} | Vectores: {total_vectores}")
+    print(f" FINALIZADO. Embebidos: {total_docs} doc(s) | Omitidos (ya listos): {omitidos} | "
+          f"Vectores nuevos: {total_vectores}")
     print(f" Dimensiones por vector: 768 (modelo {MODELO})")
     print("=" * 60)
 

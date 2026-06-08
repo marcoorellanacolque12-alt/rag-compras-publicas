@@ -344,16 +344,20 @@ def embeber_para_indexar(textos, lote=16):
     return vects
 
 
-# Esquema de la tabla vectorial (debe coincidir con indexar_bigquery.SCHEMA).
+# Esquema de la tabla vectorial (debe coincidir con indexar_bigquery.SCHEMA y la tabla viva).
 _SCHEMA_VECTOR = [
     bigquery.SchemaField("chunk_id", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("categoria", "STRING"),
     bigquery.SchemaField("documento", "STRING"),
+    bigquery.SchemaField("tipo_referencia", "STRING"),
+    bigquery.SchemaField("referencia", "STRING"),
     bigquery.SchemaField("articulo_num", "STRING"),
     bigquery.SchemaField("articulo_titulo", "STRING"),
     bigquery.SchemaField("parte", "INTEGER"),
     bigquery.SchemaField("n_chars", "INTEGER"),
     bigquery.SchemaField("texto", "STRING"),
+    bigquery.SchemaField("fase", "STRING"),
+    bigquery.SchemaField("emisor", "STRING"),
     bigquery.SchemaField("anio", "INTEGER"),
     bigquery.SchemaField("vigente", "BOOLEAN"),
     bigquery.SchemaField("embedding", "FLOAT64", mode="REPEATED"),

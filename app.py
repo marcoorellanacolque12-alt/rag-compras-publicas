@@ -69,6 +69,8 @@ from extraccion_texto import (
     extraer_pdf_inteligente, extraer_docx,
     extraer_xlsx, extraer_xls, extraer_csv, ocr_imagen_vision,
 )
+# Derivacion de fase/emisor para los documentos de la Biblioteca web.
+from chunking_articulos import fase_documento, detectar_emisor
 
 @asynccontextmanager
 async def lifespan(app):
@@ -660,15 +662,23 @@ def _procesar_biblioteca(bid, nombre, data, categoria, anio, vigente):
             actualizar_biblio(bid, estado="error", error="No se generaron fragmentos.")
             return
         vectores = embeber_para_indexar(trozos)
+        # Metadatos por documento (la Biblioteca web usa troceo generico por tamaño:
+        # tipo_referencia="seccion"/sin referencia; fase y emisor se derivan).
+        fase = fase_documento(categoria, nombre)
+        emisor = detectar_emisor(nombre, texto, categoria)
         filas = [{
             "chunk_id": f"bib_{bid}__c{idx:04d}",
             "categoria": categoria,
             "documento": nombre,
+            "tipo_referencia": "seccion",
+            "referencia": None,
             "articulo_num": None,
             "articulo_titulo": f"{nombre} (parte {idx + 1})",
             "parte": idx,
             "n_chars": len(t),
             "texto": t,
+            "fase": fase,
+            "emisor": emisor,
             "anio": anio,
             "vigente": bool(vigente),
             "embedding": v,

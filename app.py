@@ -1071,18 +1071,68 @@ HTML = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Asistente de Contrataciones Públicas — Repositorio de Casos</title>
+<!-- Tema (claro/oscuro/sistema) ANTES de pintar, para evitar parpadeo -->
+<script>(function(){try{var m=localStorage.getItem('tema')||'sistema';
+  document.documentElement.setAttribute('data-theme',{claro:'light',oscuro:'dark',sistema:'system'}[m]||'system');
+}catch(e){document.documentElement.setAttribute('data-theme','system');}})();</script>
 <script src="https://cdn.tailwindcss.com"></script>
+<script>
+  // RE-SKIN "Grafito y cobre": remapea la paleta de Tailwind a variables CSS (tokens).
+  // Asi todo el markup existente (slate/blue/amber/emerald) toma los colores del tema.
+  tailwind.config = { theme: { extend: { colors: {
+    slate: {
+      50:'rgb(var(--c100)/<alpha-value>)',  100:'rgb(var(--c100)/<alpha-value>)',
+      200:'rgb(var(--c200)/<alpha-value>)', 300:'rgb(var(--c300)/<alpha-value>)',
+      400:'rgb(var(--c400)/<alpha-value>)', 500:'rgb(var(--c500)/<alpha-value>)',
+      600:'rgb(var(--c600)/<alpha-value>)', 700:'rgb(var(--c700)/<alpha-value>)',
+      800:'rgb(var(--c800)/<alpha-value>)', 900:'rgb(var(--c900)/<alpha-value>)',
+      950:'rgb(var(--c950)/<alpha-value>)',
+    },
+    blue:    { 400:'rgb(var(--accent)/<alpha-value>)', 500:'rgb(var(--accent2)/<alpha-value>)', 600:'rgb(var(--accent)/<alpha-value>)' },
+    amber:   { 300:'rgb(var(--accent)/<alpha-value>)', 400:'rgb(var(--accent)/<alpha-value>)', 500:'rgb(var(--accent)/<alpha-value>)', 600:'rgb(var(--accent)/<alpha-value>)' },
+    emerald: { 300:'rgb(var(--c300)/<alpha-value>)', 400:'rgb(var(--c500)/<alpha-value>)', 500:'rgb(var(--c700)/<alpha-value>)' },
+    cobre:   'rgb(var(--accent)/<alpha-value>)',
+  } } } };
+</script>
 <style>
+  /* ====== TOKENS "Grafito y cobre" (canales RGB para soportar opacidades) ====== */
+  :root {                          /* CLARO (derivado; cobre exacto del spec) */
+    --c950:244 243 241; --c900:255 255 255; --c800:236 235 232; --c700:222 219 213;
+    --c600:200 197 190; --c500:122 122 130; --c400:106 106 115; --c300:90 90 98;
+    --c200:45 45 50;    --c100:38 38 42;
+    --accent:180 111 69;  --accent2:156 92 42;   /* #B46F45 / hover */
+    color-scheme: light;
+  }
+  [data-theme="dark"] {            /* OSCURO (valores EXACTOS del spec) */
+    --c950:37 40 42;    --c900:45 49 51;   --c800:54 59 62;   --c700:69 75 80;
+    --c600:90 96 102;   --c500:138 144 153;--c400:162 162 171;--c300:194 196 201;
+    --c200:233 231 227; --c100:240 238 234;
+    --accent:197 123 77;  --accent2:210 145 95;   /* #C57B4D / hover */
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {           /* SISTEMA = sigue al SO */
+    [data-theme="system"] {
+      --c950:37 40 42;    --c900:45 49 51;   --c800:54 59 62;   --c700:69 75 80;
+      --c600:90 96 102;   --c500:138 144 153;--c400:162 162 171;--c300:194 196 201;
+      --c200:233 231 227; --c100:240 238 234;
+      --accent:197 123 77;  --accent2:210 145 95;
+      color-scheme: dark;
+    }
+  }
+  body { transition: background-color .15s ease, color .15s ease; }
   .scroll-y { overflow-y: auto; }
   .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; }
-  .slider { position: absolute; cursor: pointer; inset: 0; background: #cbd5e1; border-radius: 9999px; transition: .2s; }
+  .slider { position: absolute; cursor: pointer; inset: 0; background: rgb(var(--c600)); border-radius: 9999px; transition: .2s; }
   .slider:before { content: ""; position: absolute; height: 16px; width: 16px; left: 3px; top: 3px; background: #fff; border-radius: 9999px; transition: .2s; }
-  input:checked + .slider { background: #2563eb; }
+  input:checked + .slider { background: rgb(var(--accent)); }
   input:checked + .slider:before { transform: translateX(16px); }
   .prosa { white-space: pre-wrap; line-height: 1.6; }
   .hidden-x { display: none; }
-  .panel-oculto { display: none !important; }   /* colapso del panel normativo (responsive-safe) */
+  .panel-oculto { display: none !important; }   /* colapso de paneles laterales (responsive-safe) */
+  /* Selector de tema (segmented) */
+  .tema-btn { cursor: pointer; padding: 4px 7px; border-radius: 6px; line-height: 1; }
+  .tema-btn[aria-pressed="true"] { background: rgb(var(--accent) / 0.18); }
   /* Mide comoda para el chat: limita el ancho de cada turno y lo centra */
   #chat > div { max-width: 56rem; margin-left: auto; margin-right: auto; width: 100%; }
 </style>
@@ -1090,8 +1140,8 @@ HTML = r"""
 <body class="h-screen bg-slate-950 text-slate-200">
 <div class="flex h-screen">
 
-  <!-- ============ PANEL IZQUIERDO (30%) ============ -->
-  <aside class="w-[30%] min-w-[300px] max-w-[460px] bg-slate-900 border-r border-slate-800 flex flex-col">
+  <!-- ============ PANEL IZQUIERDO (30%) — retractil ============ -->
+  <aside id="panelCasos" class="w-[30%] min-w-[300px] max-w-[460px] bg-slate-900 border-r border-slate-800 flex flex-col">
 
     <!-- VISTA A (vista-repositorio): REPOSITORIO DE CASOS — mutuamente excluyente con #vistaFuentes -->
     <div id="vistaCasos" class="flex flex-col h-full" style="display:flex">
@@ -1103,17 +1153,12 @@ HTML = r"""
       <!-- CONSULTA GENERAL: chat global contra el marco normativo (sin caso) -->
       <div class="px-5 py-4 border-b border-slate-800">
         <button id="btnConsultaGeneral" onclick="entrarConsultaGeneral()"
-                class="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold rounded-md py-2.5 transition ring-1 ring-emerald-400/30">
+                class="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold rounded-md py-2.5 transition ring-1 ring-blue-500/30">
           <span>⚖️</span> Consulta General
         </button>
         <p class="text-[11px] text-slate-500 mt-1.5 flex items-center gap-1">
           <span>🔒</span> Modo estricto: responde solo desde el marco normativo cargado (cero alucinaciones).
         </p>
-        <button id="btnBiblioteca" onclick="entrarBiblioteca()"
-                class="mt-2 w-full flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-slate-100 text-sm font-semibold rounded-md py-2 transition">
-          <span>📚</span> Biblioteca Institucional
-        </button>
-        <p class="text-[11px] text-slate-500 mt-1.5">Sube normativa global (se vectoriza con su categoría, año y vigencia para la búsqueda híbrida).</p>
       </div>
 
       <div class="px-5 py-4 border-b border-slate-800">
@@ -1251,6 +1296,10 @@ HTML = r"""
         <p class="text-xs text-slate-500 truncate mt-0.5">Caso actual: <span id="casoEnChat">— (ninguno)</span></p>
       </div>
       <div class="flex items-center gap-2 flex-none">
+        <button id="btnPanelCasos" onclick="togglePanelCasos()" title="Mostrar u ocultar Mis casos"
+                class="inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition">
+          ☰ Casos
+        </button>
         <button id="btnLimpiar" onclick="limpiarChat()" title="Limpiar chat actual"
                 class="inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed">
           🧹 Limpiar
@@ -1259,6 +1308,11 @@ HTML = r"""
                 class="hidden xl:inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition">
           ⚖️ Marco normativo
         </button>
+        <div role="group" aria-label="Apariencia" class="inline-flex items-center gap-0.5 border border-slate-700 rounded-md px-1 py-0.5 text-slate-300 text-sm">
+          <button class="tema-btn" data-tema="claro" onclick="setTema('claro')" title="Claro" aria-pressed="false">☀️</button>
+          <button class="tema-btn" data-tema="sistema" onclick="setTema('sistema')" title="Sistema" aria-pressed="false">🖥️</button>
+          <button class="tema-btn" data-tema="oscuro" onclick="setTema('oscuro')" title="Oscuro" aria-pressed="false">🌙</button>
+        </div>
       </div>
     </header>
 
@@ -1291,6 +1345,13 @@ HTML = r"""
     </div>
 
     <div class="flex-1 min-h-0 overflow-y-auto px-5 py-4">
+      <!-- Biblioteca Institucional (movida desde Mis casos al panel derecho) -->
+      <button id="btnBiblioteca" onclick="entrarBiblioteca()"
+              class="w-full flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-slate-100 text-sm font-semibold rounded-md py-2 transition">
+        <span>📚</span> Biblioteca Institucional
+      </button>
+      <p class="text-[11px] text-slate-500 mt-1.5 mb-4">Sube normativa global (se vectoriza con su categoría, año y vigencia para la búsqueda híbrida).</p>
+
       <!-- FILTROS NORMATIVOS — solo visibles en Consulta General (lo gobierna marcarModoUI) -->
       <div id="filtrosBar" class="flex flex-col gap-5" style="display:none">
 
@@ -1403,6 +1464,26 @@ function togglePanelNormativo(mostrar){
   if(!p) return;
   const ocultar = (mostrar === undefined) ? !p.classList.contains('panel-oculto') : !mostrar;
   p.classList.toggle('panel-oculto', ocultar);
+}
+// Columna izquierda "Mis casos" retractil (mismo patron que el panel derecho).
+function togglePanelCasos(mostrar){
+  const p = document.getElementById('panelCasos');
+  if(!p) return;
+  const ocultar = (mostrar === undefined) ? !p.classList.contains('panel-oculto') : !mostrar;
+  p.classList.toggle('panel-oculto', ocultar);
+}
+// ===== TEMA: claro / oscuro / sistema (persistente) =====
+function setTema(modo){
+  const dt = {claro:'light', oscuro:'dark', sistema:'system'}[modo] || 'system';
+  document.documentElement.setAttribute('data-theme', dt);
+  try { localStorage.setItem('tema', modo); } catch(e) {}
+  document.querySelectorAll('.tema-btn').forEach(b =>
+    b.setAttribute('aria-pressed', b.dataset.tema === modo ? 'true' : 'false'));
+}
+function initTema(){
+  let modo = 'sistema';
+  try { modo = localStorage.getItem('tema') || 'sistema'; } catch(e) {}
+  setTema(modo);
 }
 
 async function fetchConTimeout(url, opts, ms){
@@ -1986,6 +2067,7 @@ async function enviar(modo){
 }
 
 // =================== INIT ===================
+initTema();             // aplica tema guardado (claro/oscuro/sistema) y marca el boton activo
 mostrarVista('repo');   // estado inicial: vista-repositorio visible, detalle-caso oculto
 setChat(false); marcarModoUI();
 resetChatUI('Bienvenido. Usa <b>Consulta General</b> 🔒 para preguntar sobre el marco normativo, o entra a un caso para trabajar con tus propios documentos.');

@@ -390,21 +390,36 @@ def eliminar_por_prefijo(prefijo_chunk_id):
     bq.query(sql, job_config=cfg, location=BQ_LOCATION).result()
 
 
+_RE_ID_PREFIJO = re.compile(r'^\d{3,}-(?:ref-)?', re.IGNORECASE)
+_ACRONIMOS = {"tuo", "dl", "ds", "oece", "dtn", "ef", "mef", "pac", "jprd", "tup", "ruc", "uit"}
+
+
+def _titulo_legible(documento):
+    """Convierte el nombre de archivo en un titulo legible: quita el id numerico inicial,
+    cambia '-'/'_' por espacios y pone en mayuscula siglas conocidas (TUO, DL, OECE...)."""
+    s = _RE_ID_PREFIJO.sub('', documento or '')
+    s = re.sub(r'\s+', ' ', s.replace('_', ' ').replace('-', ' ')).strip()
+    if not s:
+        return "Documento"
+    s = ' '.join(w.upper() if w.lower() in _ACRONIMOS else w for w in s.split(' '))
+    return (s[0].upper() + s[1:])[:80].strip()
+
+
 def doc_label(documento, chunk_id=None):
     """Etiqueta legible y UNICA de un documento del vector store (FUENTE DE VERDAD
     compartida: la usan responder.py y app.py).
-    Los documentos de la Biblioteca (chunk_id 'bib_<id>__...') usan SIEMPRE su propio
-    nombre: asi una directiva cuyo nombre contiene 'reglamento'/'ley-general' no se
-    etiqueta (ni se cita) erroneamente como 'Reglamento'/'Ley'. El mapeo Ley/Reglamento
-    solo aplica al corpus normativo."""
+    Solo los DOS pilares de contrataciones reciben etiqueta corta fija ('Ley 32069',
+    'Reglamento'). Cualquier otro documento usa un TITULO LEGIBLE derivado de su nombre,
+    asi una directiva cuyo nombre contiene 'reglamento' NO se etiqueta como 'Reglamento'."""
     d = documento or ""
+    dl = d.lower()
     if chunk_id and str(chunk_id).startswith("bib_"):
-        return d or "Documento"
-    if "ley-general" in d:
-        return "Ley"
-    if "reglamento" in d:
+        return _titulo_legible(d)
+    if "ley-general-de-contrataciones" in dl:
+        return "Ley 32069"
+    if "reglamento-de-la-ley-de-contrataciones" in dl:
         return "Reglamento"
-    return d or "Documento"
+    return _titulo_legible(d)
 
 
 def formato_cita(fila):

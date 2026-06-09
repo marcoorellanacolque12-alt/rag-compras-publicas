@@ -154,9 +154,20 @@ def detectar_emisor(documento, texto, categoria=None):
     up = (documento + " " + texto[:600]).upper()    # encabezado: para codigos especificos
 
     if categoria == "leyes_y_reglamentos":
+        # Textos del marco general: distinguir su emisor real (solo dato de cita).
+        if "constitucion" in dn or "CONSTITUCIÓN POLÍTICA" in up or "CONSTITUCION POLITICA" in up:
+            return "Congreso Constituyente"
+        if "codigo-civil" in dn or "codigo civil" in dn or "CÓDIGO CIVIL" in ini or "CODIGO CIVIL" in ini:
+            return "Poder Ejecutivo (Decreto Legislativo)"
+        if dn.startswith("tuo") or "TEXTO ÚNICO ORDENADO" in up or "TEXTO UNICO ORDENADO" in up:
+            return "Poder Ejecutivo (TUO)"
+        if re.match(r'^ds[ _\-]?\d', dn) or "-ef" in dn or "_ef" in dn or ini.lstrip().startswith("DECRETO SUPREMO"):
+            return "MEF/Ejecutivo"                  # Decreto Supremo (por nombre/1a linea: no escanear cuerpo)
+        if re.match(r'^dl[ _\-]?\d', dn) or ini.lstrip().startswith("DECRETO LEGISLATIVO"):
+            return "Poder Ejecutivo (Decreto Legislativo)"
         if "ley-general" in dn or (ini.lstrip().startswith("LEY ") and "REGLAMENTO" not in ini[:40]):
             return "Congreso de la República"
-        return "MEF/Ejecutivo"                      # Reglamento / Decreto Supremo
+        return "MEF/Ejecutivo"                      # Reglamento de contrataciones / Decreto Supremo
     if categoria == "resoluciones_tribunal":
         return "TCP"
     if categoria == "opiniones":

@@ -187,7 +187,12 @@ def detectar_emisor(documento, texto, categoria=None):
     return "(emisor no identificado)"
 
 
-def es_reglamento(documento):
+def es_reglamento(documento, categoria=None):
+    """True solo para el Reglamento de contrataciones. Restringido a la categoria
+    'leyes_y_reglamentos': asi una directiva con 'reglamento' en el nombre (p.ej.
+    'reglamento-interno') NUNCA se trata como el Reglamento (fase por articulo)."""
+    if categoria is not None and categoria != "leyes_y_reglamentos":
+        return False
     d = documento.lower()
     return "reglamento" in d and "ley-general" not in d
 
@@ -458,7 +463,7 @@ def chunkear_documento(texto, categoria, documento, source_blob, vigente=True):
 
     if categoria == "leyes_y_reglamentos":
         bloques = trocear_por_articulo(cuerpo)
-        if es_reglamento(documento):
+        if es_reglamento(documento, categoria):
             # Fase por CORTES NUMERICOS de articulo (deterministas). Se evito la
             # "preferencia por titulo" porque el indice/TOC lista todos los titulos al
             # inicio y contamina la fase de los articulos tempranos.

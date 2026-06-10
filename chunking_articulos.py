@@ -365,10 +365,14 @@ def trocear_por_considerando(texto):
 
 
 def trocear_opinion(texto, documento):
-    """Una opinion suele ser un dictamen: trocea por tamaño y aplica el N° de opinion a todo."""
-    m = RE_OPINION.search(texto) or RE_OPINION.search(documento)
+    """Una opinion es un dictamen: trocea por tamaño y aplica su N° de opinion a todo.
+    El numero se toma del NOMBRE DE ARCHIVO PRIMERO (identifica al documento propio y es
+    fiable); NO del cuerpo, que puede CITAR otras opiniones (causaba mis-atribucion, p.ej.
+    una opinion etiquetada con el N° de otra que mencionaba). Se normaliza a MAYUSCULAS
+    para un formato uniforme."""
+    m = RE_OPINION.search(documento) or RE_OPINION.search(texto)
     if m:
-        num = m.group(1)
+        num = m.group(1).upper()
     else:
         ma = RE_OPINION_ALT.search(texto)
         num = ma.group(1) if ma else None

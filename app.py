@@ -60,7 +60,7 @@ from google.genai.types import GenerateContentConfig, Content, Part
 # Motor RAG ya implementado y probado.
 from responder import (
     recuperar, construir_contexto, cliente, MODELO_GEN,
-    GUARDRAIL_CONSULTA_GENERAL,
+    GUARDRAIL_CONSULTA_GENERAL, consultas_busqueda,
     embeber_para_indexar, indexar_chunks, eliminar_por_prefijo,
     con_reintentos, doc_label, listar_normas, formato_cita,
 )
@@ -128,6 +128,18 @@ INSTRUCCION_CITAS = (
     "FORMATO DE CITAS: tras cada afirmacion, coloca el marcador [N] (por ejemplo [1], [2]) "
     "del/los fragmento(s) de NORMAS RECUPERADAS que la respaldan. Usa solo numeros de "
     "fragmentos existentes; no inventes marcadores."
+)
+
+# Instruccion de PRECISION (se AÑADE; NO modifica el texto anti-alucinaciones del guardrail).
+# Evita el "no dispongo" falso cuando la cita del usuario es imprecisa pero el contexto SI
+# contiene la norma: en ese caso responde y aclara la referencia correcta.
+INSTRUCCION_PRECISION = (
+    "PRECISION Y ALCANCE: responde UNICAMENTE con la informacion del contexto. Si el usuario "
+    "cita un articulo o una norma de forma imprecisa (por ejemplo, atribuye un tema al "
+    "Reglamento cuando el contexto lo regula en la Ley, o viceversa) pero el contexto SI "
+    "contiene la norma pertinente, RESPONDE con base en el contexto y ACLARA la referencia "
+    "correcta (que norma y articulo lo regulan). Recurre a la frase de que no dispones de la "
+    "informacion SOLO cuando el contexto realmente no la contenga."
 )
 # ========================================================
 
@@ -502,7 +514,7 @@ class Mensaje(BaseModel):
     pregunta: str = ""
     fuentes_activas: list[str] = []
     modo: str = "chat"
-    k: int = 5
+    k: int = 10                    # fragmentos a recuperar (configurable; antes 5)
     historial: list[Turno] = []
     general: bool = False          # True = Consulta General (chat global sin caso, guardrail estricto)
     filtros: Filtros | None = None  # Busqueda hibrida: pre-filtering por metadatos del vector
@@ -733,6 +745,18 @@ def _responder_llm(sistema, prompt, historial):
         ),
         etiqueta="generacion")
     return resp.text
+
+
+def _historial_texto(historial, n=4):
+    """Ultimos n turnos como texto plano, para REFORMULAR la consulta (resolver
+    follow-ups). Es la misma conversacion en curso; no requiere base de datos."""
+    out = []
+    for t in (historial or [])[-n:]:
+        rol = "Asistente" if (t.rol or "").lower() in ("model", "assistant", "ia", "bot") else "Usuario"
+        txt = " ".join((t.texto or "").split())[:400]
+        if txt:
+            out.append(f"{rol}: {txt}")
+    return "\n".join(out)
 
 
 def _mensaje_error_llm(e):
@@ -987,7 +1011,8 @@ def chat(m: Mensaje):
             return JSONResponse(status_code=400, content={
                 "error": "Escribe una consulta para la Consulta General."})
 
-        filas = recuperar(pregunta, k=m.k, filtros=filtros)
+        hist_txt = _historial_texto(m.historial)
+        filas = recuperar(consultas_busqueda(pregunta, hist_txt), k=m.k, filtros=filtros)
         contexto_normas = construir_contexto(filas) if filas else "(sin normas recuperadas)"
 
         # EL CANDADO: la instruccion estricta va como system_instruction Y, ademas,
@@ -996,6 +1021,7 @@ def chat(m: Mensaje):
             GUARDRAIL_CONSULTA_GENERAL + "\n\n"
             "CONTEXTO NORMATIVO PROPORCIONADO (unica fuente de verdad):\n"
             + contexto_normas + "\n\n"
+            + INSTRUCCION_PRECISION + "\n\n"
             + INSTRUCCION_CITAS + "\n\n"
             "CONSULTA DEL USUARIO:\n" + pregunta
         )
@@ -1030,9 +1056,12 @@ def chat(m: Mensaje):
     contexto_fuentes = "\n\n".join(partes)[:MAX_CONTEXT_CHARS]
 
     # Recuperacion en la base vectorial (guiada por pregunta + etiquetas + extracto).
+    # Se expande la consulta (tema/sinonimos + follow-ups) conservando el extracto de fuentes.
     base_query = pregunta or (", ".join(etiquetas))
-    consulta = (base_query + "\n" + contexto_fuentes[:QUERY_DOC_CHARS]).strip()
-    filas = recuperar(consulta, k=m.k, filtros=filtros) if consulta else []
+    extracto = contexto_fuentes[:QUERY_DOC_CHARS]
+    qs = consultas_busqueda(base_query, _historial_texto(m.historial))
+    consultas = [f"{q}\n{extracto}".strip() for q in qs] or ([extracto] if extracto else [])
+    filas = recuperar(consultas, k=m.k, filtros=filtros) if consultas else []
     contexto_normas = construir_contexto(filas) if filas else "(sin normas recuperadas)"
 
     secciones = [f"NORMAS RECUPERADAS (base vectorial):\n{contexto_normas}"]
@@ -1051,6 +1080,7 @@ def chat(m: Mensaje):
         sistema = _sistema_chat()
         secciones.append(f"CONSULTA DEL USUARIO:\n{pregunta or '(resume y comenta las fuentes activas)'}")
 
+    secciones.append(INSTRUCCION_PRECISION)
     secciones.append(INSTRUCCION_CITAS)
     prompt = "\n\n".join(secciones)
 

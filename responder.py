@@ -43,8 +43,14 @@ TABLA = "chunks_embeddings"
 
 MODELO_EMB = "text-multilingual-embedding-002"
 MODELO_GEN = "gemini-2.5-flash"   # alternativa de mayor calidad: gemini-2.5-pro
+MODELO_EXPANSION = "gemini-2.5-flash"   # reformulacion de consulta (rapido/barato)
 
-TOP_K = 5
+TOP_K = 10                        # fragmentos a recuperar (configurable; antes 5)
+
+# Mejora de recuperacion (todo configurable):
+EXPANDIR_CONSULTA = True          # reformula/expande la consulta (tema + sinonimos)
+COMPLETAR_ARTICULO = True         # trae todas las partes del mismo articulo/numeral
+MAX_PARTES_ARTICULO = 12          # tope de partes por articulo (evita inflar el contexto)
 
 # GUARDRAIL ESTRICTO (cero alucinaciones) — fuente unica de verdad para el prompt.
 # Se inyecta como system_instruction Y se antepone al contexto recuperado (el "candado").
@@ -302,24 +308,25 @@ def listar_normas():
     return out
 
 
-def recuperar(pregunta, k, filtros=None):
-    """Devuelve los top-k chunks relevantes desde BigQuery.
-    Busqueda HIBRIDA: si se pasan `filtros`, primero se descartan por metadatos
-    (categoria / vigencia / anio) y solo luego se calcula la similitud (coseno)."""
-    qemb = _embed([pregunta], "RETRIEVAL_QUERY").embeddings[0].values
+_COLS_CHUNK = ("chunk_id", "documento", "tipo_referencia", "referencia", "fase",
+               "articulo_num", "articulo_titulo", "parte", "texto")
 
+
+def _buscar(consulta, k, filtros=None):
+    """Una busqueda vectorial (top-k) -> lista de dicts. Busqueda HIBRIDA: si se pasan
+    `filtros`, primero se descartan por metadatos (categoria/vigencia/anio) y solo luego
+    se calcula la similitud (coseno)."""
+    qemb = _embed([consulta], "RETRIEVAL_QUERY").embeddings[0].values
     bq = bigquery.Client(project=PROJECT_ID)
     tabla = f"`{PROJECT_ID}.{DATASET}.{TABLA}`"
     where, fparams = _construir_prefiltro(filtros)
-    # PRE-FILTERING: VECTOR_SEARCH busca solo dentro del subconjunto que cumple los metadatos.
     relacion = f"(SELECT * FROM {tabla} WHERE {where})" if where else f"TABLE {tabla}"
-
     sql = f"""
     SELECT base.chunk_id AS chunk_id, base.documento AS documento,
            base.tipo_referencia AS tipo_referencia, base.referencia AS referencia,
            base.fase AS fase,
            base.articulo_num AS articulo_num, base.articulo_titulo AS articulo_titulo,
-           base.texto AS texto, distance
+           base.parte AS parte, base.texto AS texto, distance
     FROM VECTOR_SEARCH(
       {relacion}, 'embedding',
       (SELECT @qemb AS embedding),
@@ -331,7 +338,136 @@ def recuperar(pregunta, k, filtros=None):
         bigquery.ScalarQueryParameter("k", "INT64", k),
         *fparams,
     ])
-    return list(bq.query(sql, job_config=cfg, location=BQ_LOCATION).result())
+    return [dict(r) for r in bq.query(sql, job_config=cfg, location=BQ_LOCATION).result()]
+
+
+def _completar_articulos(filas):
+    """Para cada chunk recuperado que sea articulo/numeral, trae TODAS las partes del
+    mismo (documento + referencia) y las ensambla CONTIGUAS y en orden de `parte`, para
+    darle al modelo el articulo COMPLETO en vez de un fragmento. Dedup por chunk_id."""
+    sep = "\x01"
+    pares = {f'{f.get("documento")}{sep}{f.get("referencia")}'
+             for f in filas
+             if f.get("tipo_referencia") in ("articulo", "numeral")
+             and f.get("referencia") and f.get("documento")}
+    if not pares:
+        return filas
+
+    bq = bigquery.Client(project=PROJECT_ID)
+    tabla = f"`{PROJECT_ID}.{DATASET}.{TABLA}`"
+    sql = f"""
+    SELECT {", ".join(_COLS_CHUNK)}
+    FROM {tabla}
+    WHERE CONCAT(documento, '{sep}', referencia) IN UNNEST(@claves)
+      AND tipo_referencia IN ('articulo', 'numeral')
+    ORDER BY documento, referencia, parte
+    """
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("claves", "STRING", sorted(pares))])
+    porart = collections.defaultdict(list)
+    for r in bq.query(sql, job_config=cfg, location=BQ_LOCATION).result():
+        porart[f'{r["documento"]}{sep}{r["referencia"]}'].append(dict(r))
+
+    salida, vistos, emitidos = [], set(), set()
+    for f in filas:
+        clave = f'{f.get("documento")}{sep}{f.get("referencia")}'
+        if clave in porart and clave not in emitidos:
+            emitidos.add(clave)
+            for parte in porart[clave][:MAX_PARTES_ARTICULO]:
+                if parte["chunk_id"] in vistos:
+                    continue
+                vistos.add(parte["chunk_id"])
+                parte.setdefault("distance", f.get("distance"))   # ordena junto al recuperado
+                salida.append(parte)
+        elif f.get("chunk_id") not in vistos:
+            vistos.add(f.get("chunk_id"))
+            salida.append(f)
+    return salida
+
+
+def recuperar(consulta, k=TOP_K, filtros=None, completar=COMPLETAR_ARTICULO):
+    """Recupera chunks relevantes. `consulta` puede ser un str o una LISTA de consultas
+    (p.ej. [original, expandida]); se busca cada una y se FUSIONAN sin duplicar (mejor
+    distancia), garantizando recall. Si `completar`, ademas trae el articulo completo."""
+    consultas = [consulta] if isinstance(consulta, str) else list(consulta)
+    consultas = list(dict.fromkeys(c.strip() for c in consultas if c and c.strip()))
+    if not consultas:
+        return []
+
+    fusion = {}
+    for c in consultas:
+        for f in _buscar(c, k, filtros):
+            cid = f["chunk_id"]
+            if cid not in fusion or f["distance"] < fusion[cid]["distance"]:
+                fusion[cid] = f
+    filas = sorted(fusion.values(), key=lambda r: r["distance"])[:k]
+    return _completar_articulos(filas) if completar else filas
+
+
+# ===== Expansion/reformulacion de consulta (mejor recall en follow-ups e imprecisas) =====
+try:                                   # apaga el "thinking" del flash si esta disponible
+    from google.genai.types import ThinkingConfig
+    _THINK_OFF = ThinkingConfig(thinking_budget=0)
+except Exception:
+    _THINK_OFF = None
+
+_RE_ESPECIFICA = re.compile(
+    r'\b(art|articulo|art[ií]culo|numeral|inciso|ley|reglamento|opini[oó]n|directiva|'
+    r'decreto|constituci[oó]n|tuo|c[oó]digo)\b', re.IGNORECASE)
+
+
+def _es_especifica(pregunta):
+    """True si la consulta ya es concreta/autocontenida (numero de art., norma citada o
+    suficientes terminos de contenido): sin historial, no necesita expansion."""
+    p = pregunta or ""
+    if any(ch.isdigit() for ch in p) or _RE_ESPECIFICA.search(p):
+        return True
+    return len([w for w in re.findall(r'\w+', p) if len(w) > 3]) >= 6
+
+
+_INSTR_EXPANSION = (
+    "Eres un asistente de busqueda juridica. Dada la conversacion y la nueva consulta, "
+    "devuelve UNICAMENTE una lista corta (5 a 12 palabras) de terminos TEMATICOS y "
+    "SINONIMOS en espanol que ayuden a encontrar la norma por el TEMA. Reglas: (a) NO "
+    "repitas ni reescribas la consulta; solo agrega terminos nuevos. (b) No inventes "
+    "numeros de articulo ni nombres de norma que no aparezcan. (c) Si es un follow-up "
+    "(p.ej. 'y para obras?'), agrega el tema de los turnos previos. (d) Si la consulta ya "
+    "es clara y no aportarias nada util, responde con una linea vacia. Responde solo los "
+    "terminos, sin prefijos ni comillas.")
+
+
+def reformular_consulta(pregunta, historial_texto=""):
+    """Devuelve SOLO terminos a AÑADIR (sinonimos/tema); '' si no aporta. NO reescribe ni
+    quita: la consulta final sera 'original + estos terminos', asi los terminos especificos
+    del original (numeros de articulo, nombres, keywords) NUNCA se pierden."""
+    prompt = (f"Conversacion reciente:\n{historial_texto or '(ninguna)'}\n\n"
+              f"Nueva consulta: {pregunta}\n\n{_INSTR_EXPANSION}")
+    cfg = dict(temperature=0.1, max_output_tokens=256)
+    if _THINK_OFF is not None:
+        cfg["thinking_config"] = _THINK_OFF
+    try:
+        resp = con_reintentos(
+            lambda: cliente().models.generate_content(
+                model=MODELO_EXPANSION, contents=prompt,
+                config=GenerateContentConfig(**cfg)),
+            etiqueta="expansion")
+        extra = " ".join((resp.text or "").split()).strip(' "\'')
+        return extra if 0 < len(extra) <= 200 else ""
+    except Exception:
+        return ""                      # ante fallo, NO degradar: se busca con el original
+
+
+def consultas_busqueda(pregunta, historial_texto=""):
+    """Consultas para `recuperar`: [original] o [original, 'original + expansion'].
+    Salta la expansion (ahorra la llamada flash) si NO hay historial y la consulta ya es
+    especifica. El dual-search preserva el recall de la consulta directa."""
+    pregunta = (pregunta or "").strip()
+    if not EXPANDIR_CONSULTA or not pregunta:
+        return [pregunta] if pregunta else []
+    if not historial_texto and _es_especifica(pregunta):
+        return [pregunta]
+    extra = reformular_consulta(pregunta, historial_texto)
+    return [pregunta, f"{pregunta} {extra}"] if extra else [pregunta]
 
 
 def embeber_para_indexar(textos, lote=16):
@@ -456,7 +592,7 @@ def construir_contexto(filas):
 
 
 def responder(pregunta, k=TOP_K, modelo=MODELO_GEN):
-    filas = recuperar(pregunta, k)
+    filas = recuperar(consultas_busqueda(pregunta), k)
     if not filas:
         return "No se encontraron fragmentos normativos relevantes.", []
 

@@ -34,6 +34,7 @@ Uso:
 import json
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import storage
 from google import genai
 from google.genai.types import EmbedContentConfig
@@ -89,17 +90,71 @@ def embed_lote(client, textos):
     raise RuntimeError("Lote fallido tras varios reintentos.")
 
 
+def _procesar_blob(storage_client, genai_client, blob_name, existentes, rehacer):
+    """Procesa UN documento (descarga chunks, salto incremental, embebe, sube).
+    Thread-safe: los clientes de storage/genai admiten uso concurrente; embed_lote
+    conserva el backoff. Devuelve ('skip'|'ok', n_vectores)."""
+    bucket = storage_client.bucket(BUCKET_NAME)
+    chunks = [json.loads(l) for l in bucket.blob(blob_name).download_as_text().splitlines()
+              if l.strip()]
+    if not chunks:
+        return ("skip", 0)
+
+    documento = chunks[0]["documento"]
+    categoria = chunks[0]["categoria"]
+    salida = f"{PREFIJO_SALIDA}/{categoria}/{documento}.json"
+
+    # Salto incremental: si ya existe el embedding con EXACTAMENTE los mismos chunk_id,
+    # esta completo -> no re-procesar. Si difieren (re-chunkeo) o falta -> (re)generar.
+    if not rehacer and salida in existentes:
+        ids_in = {c["chunk_id"] for c in chunks}
+        try:
+            ids_out = {json.loads(l)["id"]
+                       for l in existentes[salida].download_as_text().splitlines() if l.strip()}
+        except Exception:
+            ids_out = set()
+        if ids_out == ids_in:
+            print(f"-> SKIP (ya embebido, {len(chunks)} chunks): {documento}", flush=True)
+            return ("skip", 0)
+        print(f"-> RE-EMBED (cambiaron los chunks): {documento} ({len(chunks)} chunks)", flush=True)
+    else:
+        print(f"-> Embeddings: {documento} ({len(chunks)} chunks)", flush=True)
+
+    lineas_salida = []
+    for i in range(0, len(chunks), BATCH_SIZE):
+        lote = chunks[i:i + BATCH_SIZE]
+        vectores = embed_lote(genai_client, [c["texto"] for c in lote])
+        for c, vec in zip(lote, vectores):
+            lineas_salida.append(json.dumps({
+                "id": c["chunk_id"],
+                "embedding": vec,
+                "restricts": [
+                    {"namespace": "categoria", "allow": [c["categoria"]]},
+                    {"namespace": "documento", "allow": [c["documento"]]},
+                ],
+                "crowding_tag": c["documento"],
+            }))
+
+    bucket.blob(salida).upload_from_string(
+        "\n".join(lineas_salida), content_type="application/json")
+    print(f"   [OK] {len(lineas_salida)} vectores  ->  {documento}", flush=True)
+    return ("ok", len(lineas_salida))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Genera embeddings de los chunks en GCS.")
     parser.add_argument("--solo", default=None, help="Filtra por categoria (ej: leyes_y_reglamentos).")
     parser.add_argument("--rehacer", action="store_true",
                         help="Re-embebe TODO aunque ya exista (ignora el salto incremental).")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Documentos en paralelo (default 1 = secuencial). El backoff "
+                             "absorbe 429 si se toca el techo de cuota.")
     args = parser.parse_args()
 
     print("=" * 60)
     print(" FASE 3 RAG - GENERACION DE EMBEDDINGS")
     print("=" * 60)
-    print(f"Modelo: {MODELO} | Bucket: gs://{BUCKET_NAME} | batch={BATCH_SIZE}\n")
+    print(f"Modelo: {MODELO} | Bucket: gs://{BUCKET_NAME} | batch={BATCH_SIZE} | workers={args.workers}\n", flush=True)
 
     storage_client = storage.Client(project=PROJECT_ID)
     genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
@@ -112,65 +167,36 @@ def main():
     existentes = {b.name: b for b in storage_client.list_blobs(BUCKET_NAME, prefix=f"{PREFIJO_SALIDA}/{sub}")
                   if b.name.endswith(".json")}
     if args.rehacer:
-        print("[modo --rehacer] se re-embebera todo, ignorando lo existente.\n")
+        print("[modo --rehacer] se re-embebera todo, ignorando lo existente.\n", flush=True)
 
-    total_vectores = 0
-    total_docs = 0
-    omitidos = 0
+    nombres = [b.name for b in storage_client.list_blobs(BUCKET_NAME, prefix=prefijo)
+               if b.name.endswith(".jsonl")]
+    print(f"Documentos a revisar: {len(nombres)}\n", flush=True)
 
-    for blob in storage_client.list_blobs(BUCKET_NAME, prefix=prefijo):
-        if not blob.name.endswith(".jsonl"):
-            continue
-
-        chunks = [json.loads(l) for l in blob.download_as_text().splitlines() if l.strip()]
-        if not chunks:
-            continue
-
-        documento = chunks[0]["documento"]
-        categoria = chunks[0]["categoria"]
-        salida = f"{PREFIJO_SALIDA}/{categoria}/{documento}.json"
-
-        # Salto incremental: si ya existe el embedding con EXACTAMENTE los mismos chunk_id,
-        # esta completo -> no re-procesar. Si difieren (re-chunkeo) o falta -> (re)generar.
-        if not args.rehacer and salida in existentes:
-            ids_in = {c["chunk_id"] for c in chunks}
+    total_vectores = total_docs = omitidos = errores = 0
+    hechos = 0
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futs = {pool.submit(_procesar_blob, storage_client, genai_client, n,
+                            existentes, args.rehacer): n for n in nombres}
+        for fut in as_completed(futs):
+            hechos += 1
             try:
-                ids_out = {json.loads(l)["id"]
-                           for l in existentes[salida].download_as_text().splitlines() if l.strip()}
-            except Exception:
-                ids_out = set()
-            if ids_out == ids_in:
-                print(f"-> SKIP (ya embebido, {len(chunks)} chunks): {documento}")
-                omitidos += 1
+                estado, nvec = fut.result()
+            except Exception as e:
+                errores += 1
+                print(f"   [ERROR] {futs[fut]}: {e}", flush=True)
                 continue
-            print(f"-> RE-EMBED (cambiaron los chunks): {documento} ({len(chunks)} chunks)")
-        else:
-            print(f"-> Embeddings: {documento} ({len(chunks)} chunks)")
-
-        lineas_salida = []
-        for i in range(0, len(chunks), BATCH_SIZE):
-            lote = chunks[i:i + BATCH_SIZE]
-            vectores = embed_lote(genai_client, [c["texto"] for c in lote])
-
-            for c, vec in zip(lote, vectores):
-                lineas_salida.append(json.dumps({
-                    "id": c["chunk_id"],
-                    "embedding": vec,
-                    "restricts": [
-                        {"namespace": "categoria", "allow": [c["categoria"]]},
-                        {"namespace": "documento", "allow": [c["documento"]]},
-                    ],
-                    "crowding_tag": c["documento"],
-                }))
-            print(f"   ... {min(i + BATCH_SIZE, len(chunks))}/{len(chunks)}")
-
-        salida = f"{PREFIJO_SALIDA}/{categoria}/{documento}.json"
-        storage_client.bucket(BUCKET_NAME).blob(salida).upload_from_string(
-            "\n".join(lineas_salida), content_type="application/json"
-        )
-        print(f"   [OK] {len(lineas_salida)} vectores  ->  gs://{BUCKET_NAME}/{salida}")
-        total_vectores += len(lineas_salida)
-        total_docs += 1
+            if estado == "ok":
+                total_docs += 1
+                total_vectores += nvec
+            else:
+                omitidos += 1
+            if hechos % 200 == 0:
+                print(f"   == progreso: {hechos}/{len(nombres)} docs "
+                      f"(ok={total_docs} skip={omitidos} err={errores}) ==", flush=True)
+    if errores:
+        print(f"\n[!] {errores} documento(s) con error: relanzar el script los reintenta "
+              f"(incremental).", flush=True)
 
     print("\n" + "=" * 60)
     print(f" FINALIZADO. Embebidos: {total_docs} doc(s) | Omitidos (ya listos): {omitidos} | "

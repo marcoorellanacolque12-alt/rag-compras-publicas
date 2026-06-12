@@ -37,6 +37,8 @@ import argparse
 from google.cloud import storage
 from google import genai
 from google.genai.types import EmbedContentConfig
+# Config CENTRAL de embeddings (mismo modelo/dims que la CONSULTA en responder.py).
+from config_emb import MODELO_EMB, OUTPUT_DIM, recortar, normalizar
 
 # ===================== CONFIGURACION =====================
 PROJECT_ID = "project-a0134db0-3990-4ec2-bc3"
@@ -46,12 +48,11 @@ BUCKET_NAME = "repositorio-compras-publicas"
 PREFIJO_ENTRADA = "chunks"
 PREFIJO_SALIDA = "embeddings"
 
-MODELO = "text-multilingual-embedding-002"   # 768 dims, multilingue (espanol)
+MODELO = MODELO_EMB                           # gemini-embedding-001 (fuente unica)
 TASK_TYPE = "RETRIEVAL_DOCUMENT"             # tarea: indexar documentos para busqueda
 
-# Tamano de lote por llamada (limites de Vertex: <=250 instancias y
-# ~20.000 tokens por request). 16 es seguro para chunks de ~1000 tokens.
-BATCH_SIZE = 16
+# gemini-embedding-001: 1 texto por request (batch efectivo = 1).
+BATCH_SIZE = 1
 MAX_REINTENTOS = 4
 # ========================================================
 
@@ -70,10 +71,10 @@ def embed_lote(client, textos):
         try:
             resp = client.models.embed_content(
                 model=MODELO,
-                contents=textos,
-                config=EmbedContentConfig(task_type=TASK_TYPE),
+                contents=[recortar(t) for t in textos],
+                config=EmbedContentConfig(task_type=TASK_TYPE, output_dimensionality=OUTPUT_DIM),
             )
-            return [e.values for e in resp.embeddings]
+            return [normalizar(e.values) for e in resp.embeddings]
         except Exception as e:
             # Lote demasiado grande en tokens -> dividir y reintentar por mitades.
             if len(textos) > 1 and _excede_tokens(e):

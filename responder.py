@@ -32,6 +32,8 @@ import collections
 from google.cloud import bigquery
 from google import genai
 from google.genai.types import EmbedContentConfig, GenerateContentConfig
+# Config CENTRAL de embeddings (mismo modelo/dims que generar_embeddings.py).
+from config_emb import MODELO_EMB, OUTPUT_DIM, recortar, normalizar
 
 # ===================== CONFIGURACION =====================
 PROJECT_ID = "project-a0134db0-3990-4ec2-bc3"
@@ -41,7 +43,6 @@ BQ_LOCATION = "US"
 DATASET = "rag_compras"
 TABLA = "chunks_embeddings"
 
-MODELO_EMB = "text-multilingual-embedding-002"
 MODELO_GEN = "gemini-2.5-flash"   # alternativa de mayor calidad: gemini-2.5-pro
 MODELO_EXPANSION = "gemini-2.5-flash"   # reformulacion de consulta (rapido/barato)
 
@@ -192,12 +193,15 @@ def con_reintentos(fn, etiqueta="API"):
 
 
 def _embed(textos, task_type):
-    """Embebe (RETRIEVAL_QUERY/DOCUMENT) con reintentos. Corre en hilo del threadpool:
-    el time.sleep del backoff pausa SOLO ese hilo, sin bloquear el event loop ni a otros."""
-    cfg = EmbedContentConfig(task_type=task_type)
-    return con_reintentos(
-        lambda: cliente().models.embed_content(model=MODELO_EMB, contents=textos, config=cfg),
+    """Embebe (RETRIEVAL_QUERY/DOCUMENT) con reintentos y devuelve vectores YA NORMALIZADOS
+    (L2) al OUTPUT_DIM configurado. Corre en hilo del threadpool: el time.sleep del backoff
+    pausa SOLO ese hilo, sin bloquear el event loop ni a otros."""
+    cfg = EmbedContentConfig(task_type=task_type, output_dimensionality=OUTPUT_DIM)
+    entradas = [recortar(t) for t in textos]
+    resp = con_reintentos(
+        lambda: cliente().models.embed_content(model=MODELO_EMB, contents=entradas, config=cfg),
         etiqueta="embeddings")
+    return [normalizar(e.values) for e in resp.embeddings]
 
 
 # --- Control PROACTIVO de tasa para la INDEXACION masiva (embeddings) ---
@@ -316,7 +320,7 @@ def _buscar(consulta, k, filtros=None):
     """Una busqueda vectorial (top-k) -> lista de dicts. Busqueda HIBRIDA: si se pasan
     `filtros`, primero se descartan por metadatos (categoria/vigencia/anio) y solo luego
     se calcula la similitud (coseno)."""
-    qemb = _embed([consulta], "RETRIEVAL_QUERY").embeddings[0].values
+    qemb = _embed([consulta], "RETRIEVAL_QUERY")[0]
     bq = bigquery.Client(project=PROJECT_ID)
     tabla = f"`{PROJECT_ID}.{DATASET}.{TABLA}`"
     where, fparams = _construir_prefiltro(filtros)
@@ -470,14 +474,14 @@ def consultas_busqueda(pregunta, historial_texto=""):
     return [pregunta, f"{pregunta} {extra}"] if extra else [pregunta]
 
 
-def embeber_para_indexar(textos, lote=16):
+def embeber_para_indexar(textos, lote=1):   # gemini-embedding-001: 1 texto por request
     """Embebe una lista de fragmentos para INDEXAR (task_type=RETRIEVAL_DOCUMENT,
-    simetrico al RETRIEVAL_QUERY de la consulta). Devuelve lista de vectores 768-dim."""
+    simetrico al RETRIEVAL_QUERY de la consulta). Devuelve vectores normalizados al
+    OUTPUT_DIM configurado (mismo modelo/dims que la consulta -> coseno consistente)."""
     vects = []
     for i in range(0, len(textos), lote):
         sub = textos[i:i + lote]
-        resp = _embed_indexar(sub)   # control proactivo de tasa (concurrencia + RPM)
-        vects.extend([e.values for e in resp.embeddings])
+        vects.extend(_embed_indexar(sub))   # control proactivo de tasa; ya normaliza
     return vects
 
 

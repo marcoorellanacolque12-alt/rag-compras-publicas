@@ -24,6 +24,7 @@
 !buscar.py
 !responder.py
 !reset_corpus.py
+!config_emb.py
 
 # Aplicacion web (API + UI) y despliegue
 !app.py

@@ -175,7 +175,7 @@ def main():
     print("\n" + "=" * 60)
     print(f" FINALIZADO. Embebidos: {total_docs} doc(s) | Omitidos (ya listos): {omitidos} | "
           f"Vectores nuevos: {total_vectores}")
-    print(f" Dimensiones por vector: 768 (modelo {MODELO})")
+    print(f" Dimensiones por vector: {OUTPUT_DIM} (modelo {MODELO})")
     print("=" * 60)
 
 

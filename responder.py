@@ -312,7 +312,7 @@ def listar_normas():
     return out
 
 
-_COLS_CHUNK = ("chunk_id", "documento", "tipo_referencia", "referencia", "fase",
+_COLS_CHUNK = ("chunk_id", "documento", "tipo_referencia", "referencia", "fase", "emisor",
                "articulo_num", "articulo_titulo", "parte", "texto")
 
 
@@ -328,7 +328,7 @@ def _buscar(consulta, k, filtros=None):
     sql = f"""
     SELECT base.chunk_id AS chunk_id, base.documento AS documento,
            base.tipo_referencia AS tipo_referencia, base.referencia AS referencia,
-           base.fase AS fase,
+           base.fase AS fase, base.emisor AS emisor,
            base.articulo_num AS articulo_num, base.articulo_titulo AS articulo_titulo,
            base.parte AS parte, base.texto AS texto, distance
     FROM VECTOR_SEARCH(

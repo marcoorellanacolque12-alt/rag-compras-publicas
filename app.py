@@ -141,6 +141,26 @@ INSTRUCCION_PRECISION = (
     "correcta (que norma y articulo lo regulan). Recurre a la frase de que no dispones de la "
     "informacion SOLO cuando el contexto realmente no la contenga."
 )
+
+# Instruccion de ESTRUCTURA de la respuesta (ADITIVA; el guardrail no se toca).
+INSTRUCCION_ESTRUCTURA = (
+    "ESTRUCTURA DE LA RESPUESTA: comienza con una apertura DIRECTA de 1-2 frases que responda "
+    "la pregunta. Si hay varias reglas, supuestos o condiciones, desarrollalas despues en "
+    "puntos o numeracion (una idea por punto). Cierra indicando la referencia normativa "
+    "principal que sustenta la respuesta."
+)
+
+# Instruccion de CRUCE Ley<->Reglamento ANCLADO al contexto (ADITIVA).
+INSTRUCCION_CRUCE = (
+    "CRUCE LEY-REGLAMENTO (OBLIGATORIO): revisa TODOS los fragmentos del contexto. Si ademas "
+    "del articulo de la Ley que responde la pregunta hay articulos del Reglamento (u otras "
+    "normas) que desarrollan ese mismo tema, DEBES mencionarlos en la respuesta, indicando la "
+    "relacion explicitamente (por ejemplo: 'regulado en el art. X de la Ley [n] y desarrollado "
+    "en los arts. Y [n] y Z [n] del Reglamento') y citando cada uno con su marcador [N]. "
+    "REGLA DURA: solo puedes cruzar normas PRESENTES en el contexto recuperado; NUNCA cites "
+    "articulos o normas de memoria. Si el desarrollo reglamentario no esta en el contexto, "
+    "no lo inventes ni lo insinues."
+)
 # ========================================================
 
 
@@ -531,6 +551,7 @@ def _fuentes_normativas(filas):
         "tipo_referencia": f.get("tipo_referencia"),
         "referencia": f.get("referencia"),
         "fase": f.get("fase"),
+        "emisor": f.get("emisor"),
         "texto": f["texto"],                                          # texto TEXTUAL del fragmento
         "articulo_num": f["articulo_num"],
         "articulo_titulo": f["articulo_titulo"],
@@ -1022,6 +1043,8 @@ def chat(m: Mensaje):
             "CONTEXTO NORMATIVO PROPORCIONADO (unica fuente de verdad):\n"
             + contexto_normas + "\n\n"
             + INSTRUCCION_PRECISION + "\n\n"
+            + INSTRUCCION_ESTRUCTURA + "\n\n"
+            + INSTRUCCION_CRUCE + "\n\n"
             + INSTRUCCION_CITAS + "\n\n"
             "CONSULTA DEL USUARIO:\n" + pregunta
         )
@@ -1081,6 +1104,8 @@ def chat(m: Mensaje):
         secciones.append(f"CONSULTA DEL USUARIO:\n{pregunta or '(resume y comenta las fuentes activas)'}")
 
     secciones.append(INSTRUCCION_PRECISION)
+    secciones.append(INSTRUCCION_ESTRUCTURA)
+    secciones.append(INSTRUCCION_CRUCE)
     secciones.append(INSTRUCCION_CITAS)
     prompt = "\n\n".join(secciones)
 
@@ -1576,7 +1601,7 @@ function abrirCita(cid){
       ? (etiquetaTipo(fr.tipo_referencia) + (fr.referencia ? (' ' + fr.referencia) : ''))
       : (fr.cita || '');
   document.getElementById('citaMeta').textContent =
-      [refTxt, fr.fase ? ('fase: ' + fr.fase) : ''].filter(Boolean).join('  ·  ');
+      [refTxt, fr.fase ? ('fase: ' + fr.fase) : '', fr.emisor || ''].filter(Boolean).join('  ·  ');
   document.getElementById('citaTexto').textContent = fr.texto || '(sin texto del fragmento)';
   document.getElementById('citaPanel').classList.remove('hidden-x');
 }

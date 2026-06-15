@@ -107,9 +107,44 @@ def cargar_embeddings(storage_client, solo=None):
     return vects
 
 
+def _fila_de_chunk(cid, c, emb):
+    """Construye la fila de BigQuery para un chunk + su vector."""
+    return {
+        "chunk_id": cid,
+        "categoria": c.get("categoria"),
+        "documento": c.get("documento"),
+        "tipo_referencia": c.get("tipo_referencia"),
+        "referencia": c.get("referencia"),
+        "articulo_num": c.get("articulo_num"),
+        "articulo_titulo": c.get("articulo_titulo"),
+        "parte": c.get("parte"),
+        "n_chars": c.get("n_chars"),
+        "texto": c.get("texto"),
+        "fase": c.get("fase"),
+        "emisor": c.get("emisor"),
+        "anio": c.get("anio"),
+        "vigente": c.get("vigente", True),
+        "embedding": emb,
+    }
+
+
+def _flush(bq, tabla_id, buffer):
+    """Carga un lote de filas (WRITE_APPEND) y vacia el buffer."""
+    if not buffer:
+        return 0
+    job_config = bigquery.LoadJobConfig(
+        schema=SCHEMA, write_disposition=bigquery.WriteDisposition.WRITE_APPEND)
+    bq.load_table_from_json(buffer, tabla_id, job_config=job_config).result()
+    n = len(buffer)
+    buffer.clear()
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="Indexa chunks+embeddings en BigQuery (incremental).")
     parser.add_argument("--solo", default=None, help="Filtra por categoria (ej: directivas).")
+    parser.add_argument("--lote", type=int, default=5000,
+                        help="Filas por carga a BigQuery (streaming, memoria acotada).")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -127,70 +162,59 @@ def main():
     bq.create_dataset(ds_ref, exists_ok=True)
     print(f"[OK] Dataset listo: {PROJECT_ID}.{DATASET} ({LOCATION})")
 
-    # 2) Unir metadatos + vectores por id (acotado por --solo si se indica).
-    print("-> Cargando chunks y embeddings desde GCS...")
-    meta = cargar_metadatos(storage_client, args.solo)
-    vects = cargar_embeddings(storage_client, args.solo)
-    print(f"   chunks: {len(meta)} | vectores: {len(vects)}")
+    tabla_id = f"{PROJECT_ID}.{DATASET}.{TABLA}"
+    prefijo_ch = f"{PREFIJO_CHUNKS}/{args.solo}/" if args.solo else f"{PREFIJO_CHUNKS}/"
 
-    filas = []
-    sin_vector = 0
-    for cid, c in meta.items():
-        if cid not in vects:
-            sin_vector += 1
+    # 2) Listar los documentos a cargar (por nombre de blob; SIN descargar).
+    chunk_blobs = [b.name for b in storage_client.list_blobs(BUCKET_NAME, prefix=prefijo_ch)
+                   if b.name.endswith(".jsonl")]
+    docs = sorted({n.split("/")[-1][:-len(".jsonl")] for n in chunk_blobs})
+    print(f"-> Documentos a indexar: {len(docs)} | streaming en lotes de {args.lote} filas")
+    if not docs:
+        print("   [!] Nada que indexar."); return
+
+    # 3a) DEDUP idempotente por lotes de documentos (clave = documento), sin tocar bib_.
+    LOTE_DOCS = 2000
+    for i in range(0, len(docs), LOTE_DOCS):
+        sub = docs[i:i + LOTE_DOCS]
+        bq.query(
+            f"DELETE FROM `{tabla_id}` WHERE documento IN UNNEST(@docs) AND NOT STARTS_WITH(chunk_id, 'bib_')",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("docs", "STRING", sub)]),
+            location=LOCATION).result()
+    print(f"-> Dedup: borrados chunks previos de {len(docs)} documento(s).")
+
+    # 3b) Carga STREAMING por documento (memoria acotada): chunks/<doc>.jsonl +
+    #     embeddings/<doc>.json se unen por id y se vuelcan en lotes de --lote filas.
+    bucket = storage_client.bucket(BUCKET_NAME)
+    buffer, cargadas, sin_vector, docs_ok = [], 0, 0, 0
+    for nombre in chunk_blobs:
+        cat_doc = nombre[len(PREFIJO_CHUNKS) + 1:-len(".jsonl")]   # "<categoria>/<doc>"
+        emb_blob = bucket.blob(f"{PREFIJO_EMB}/{cat_doc}.json")
+        if not emb_blob.exists():
+            continue                                  # doc sin vector (p.ej. escaneado vacio)
+        vects = {o["id"]: o["embedding"] for o in _lineas_jsonl(emb_blob)}
+        if not vects:
             continue
-        filas.append({
-            "chunk_id": cid,
-            "categoria": c.get("categoria"),
-            "documento": c.get("documento"),
-            "tipo_referencia": c.get("tipo_referencia"),   # troceo consciente del tipo
-            "referencia": c.get("referencia"),
-            "articulo_num": c.get("articulo_num"),          # espejo de transicion
-            "articulo_titulo": c.get("articulo_titulo"),
-            "parte": c.get("parte"),
-            "n_chars": c.get("n_chars"),
-            "texto": c.get("texto"),
-            "fase": c.get("fase"),                 # pre-filtering por fase
-            "emisor": c.get("emisor"),             # dato de cita
-            "anio": c.get("anio"),                 # metadato para pre-filtering
-            "vigente": c.get("vigente", True),     # por defecto: vigente
-            "embedding": vects[cid],
-        })
+        for c in _lineas_jsonl(bucket.blob(nombre)):
+            emb = vects.get(c["chunk_id"])
+            if emb is None:
+                sin_vector += 1
+                continue
+            buffer.append(_fila_de_chunk(c["chunk_id"], c, emb))
+            if len(buffer) >= args.lote:
+                cargadas += _flush(bq, tabla_id, buffer)
+                print(f"   ... {cargadas} filas cargadas", flush=True)
+        docs_ok += 1
+    cargadas += _flush(bq, tabla_id, buffer)
     if sin_vector:
         print(f"   [!] {sin_vector} chunks sin vector (omitidos).")
 
-    if not filas:
-        print("   [!] No hay chunks para cargar. Nada que hacer.")
-        return
-
-    tabla_id = f"{PROJECT_ID}.{DATASET}.{TABLA}"
-
-    # 3a) DEDUP idempotente: borra los chunks PREVIOS del corpus para los documentos
-    #     de este lote (clave = documento), SIN tocar las directivas de la Biblioteca web
-    #     (chunk_id 'bib_*'). Asi re-cargar un documento lo reemplaza limpio, sin duplicar.
-    docs_lote = sorted({f["documento"] for f in filas if f.get("documento")})
-    if docs_lote:
-        del_sql = (f"DELETE FROM `{tabla_id}` "
-                   f"WHERE documento IN UNNEST(@docs) AND NOT STARTS_WITH(chunk_id, 'bib_')")
-        del_cfg = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("docs", "STRING", docs_lote)])
-        print(f"-> Dedup: borrando chunks previos de {len(docs_lote)} documento(s) del corpus...")
-        bq.query(del_sql, job_config=del_cfg, location=LOCATION).result()
-
-    # 3b) Cargar (WRITE_APPEND -> carga incremental por lotes, no borra lo anterior).
-    job_config = bigquery.LoadJobConfig(
-        schema=SCHEMA,
-        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-    )
-    print(f"-> Cargando {len(filas)} filas (APPEND) en {tabla_id} ...")
-    job = bq.load_table_from_json(filas, tabla_id, job_config=job_config)
-    job.result()  # espera
-
     tabla = bq.get_table(tabla_id)
     print("\n" + "=" * 60)
-    print(f" [OK] Lote cargado: {len(filas)} filas | {len(docs_lote)} documento(s) reemplazado(s).")
+    print(f" [OK] Indexado: {cargadas} filas de {docs_ok} documento(s).")
     print(f"      Tabla {tabla_id}: {tabla.num_rows} filas | {tabla.num_bytes/1024/1024:.2f} MB")
-    print("      Carga INCREMENTAL idempotente (WRITE_APPEND + dedup por documento).")
+    print("      Carga STREAMING idempotente (dedup por documento + WRITE_APPEND por lotes).")
     print("=" * 60)
 
 

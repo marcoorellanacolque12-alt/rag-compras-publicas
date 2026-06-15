@@ -95,7 +95,9 @@ def _procesar_blob(storage_client, genai_client, blob_name, existentes, rehacer)
     Thread-safe: los clientes de storage/genai admiten uso concurrente; embed_lote
     conserva el backoff. Devuelve ('skip'|'ok', n_vectores)."""
     bucket = storage_client.bucket(BUCKET_NAME)
-    chunks = [json.loads(l) for l in bucket.blob(blob_name).download_as_text().splitlines()
+    # Dividir SOLO por '\n' (no splitlines()): el texto puede traer separadores Unicode
+    # ( / /\x85 de PDFs) que splitlines() partiria, rompiendo el registro JSONL.
+    chunks = [json.loads(l) for l in bucket.blob(blob_name).download_as_text().split("\n")
               if l.strip()]
     if not chunks:
         return ("skip", 0)
@@ -110,7 +112,7 @@ def _procesar_blob(storage_client, genai_client, blob_name, existentes, rehacer)
         ids_in = {c["chunk_id"] for c in chunks}
         try:
             ids_out = {json.loads(l)["id"]
-                       for l in existentes[salida].download_as_text().splitlines() if l.strip()}
+                       for l in existentes[salida].download_as_text().split("\n") if l.strip()}
         except Exception:
             ids_out = set()
         if ids_out == ids_in:

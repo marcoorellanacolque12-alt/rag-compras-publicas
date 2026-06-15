@@ -69,6 +69,20 @@ SCHEMA = [
 ]
 
 
+def _lineas_jsonl(blob):
+    """Itera registros de un JSONL. Divide SOLO por '\\n' (no splitlines()): el texto de
+    los chunks puede contener separadores Unicode (\\u2028/\\u2029/\\x85, comunes en PDFs)
+    que json.dumps(ensure_ascii=False) deja literales y que splitlines() partiria, rompiendo
+    el registro. Una linea ilegible se SALTA con aviso (no aborta la carga)."""
+    for linea in blob.download_as_text().split("\n"):
+        if not linea.strip():
+            continue
+        try:
+            yield json.loads(linea)
+        except json.JSONDecodeError as e:
+            print(f"   [!] linea ilegible en {blob.name} (saltada): {e}")
+
+
 def cargar_metadatos(storage_client, solo=None):
     """id -> dict de metadatos (de chunks/, opcionalmente filtrado por categoria)."""
     prefijo = f"{PREFIJO_CHUNKS}/{solo}/" if solo else f"{PREFIJO_CHUNKS}/"
@@ -76,10 +90,8 @@ def cargar_metadatos(storage_client, solo=None):
     for blob in storage_client.list_blobs(BUCKET_NAME, prefix=prefijo):
         if not blob.name.endswith(".jsonl"):
             continue
-        for linea in blob.download_as_text().splitlines():
-            if linea.strip():
-                c = json.loads(linea)
-                meta[c["chunk_id"]] = c
+        for c in _lineas_jsonl(blob):
+            meta[c["chunk_id"]] = c
     return meta
 
 
@@ -90,10 +102,8 @@ def cargar_embeddings(storage_client, solo=None):
     for blob in storage_client.list_blobs(BUCKET_NAME, prefix=prefijo):
         if not blob.name.endswith(".json"):
             continue
-        for linea in blob.download_as_text().splitlines():
-            if linea.strip():
-                o = json.loads(linea)
-                vects[o["id"]] = o["embedding"]
+        for o in _lineas_jsonl(blob):
+            vects[o["id"]] = o["embedding"]
     return vects
 
 

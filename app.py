@@ -64,6 +64,7 @@ from responder import (
     embeber_para_indexar, indexar_chunks, eliminar_por_prefijo,
     con_reintentos, doc_label, listar_normas, formato_cita,
 )
+from citas import verificar_citas   # fidelidad de citas (neutraliza [N] inventados)
 # Motores de extraccion (en memoria): PDF+OCR, DOCX, Excel/CSV->Markdown, imagen->OCR.
 from extraccion_texto import (
     extraer_pdf_inteligente, extraer_docx,
@@ -1052,11 +1053,13 @@ def chat(m: Mensaje):
             respuesta = _responder_llm(_sistema_consulta_general(), prompt, m.historial)
         except Exception as e:
             return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
+        chequeo = verificar_citas(respuesta, len(filas))   # neutraliza [N] inventados
         return {
-            "respuesta": respuesta,
+            "respuesta": chequeo["respuesta_limpia"],
             "modo": "general",
             "fuentes_usadas": [],
             "fuentes_normativas": _fuentes_normativas(filas),
+            "citas_invalidas": chequeo["citas_invalidas"],
         }
 
     # ===== CHAT / ANALISIS dentro de un caso =====
@@ -1115,11 +1118,13 @@ def chat(m: Mensaje):
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
+    chequeo = verificar_citas(respuesta, len(filas))   # neutraliza [N] inventados
     return {
-        "respuesta": respuesta,
+        "respuesta": chequeo["respuesta_limpia"],
         "modo": m.modo,
         "fuentes_usadas": [{"id": f["id"], "nombre": f["nombre"]} for f in activos],
         "fuentes_normativas": _fuentes_normativas(filas),
+        "citas_invalidas": chequeo["citas_invalidas"],
     }
 
 

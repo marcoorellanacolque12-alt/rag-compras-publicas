@@ -34,6 +34,8 @@ from google import genai
 from google.genai.types import EmbedContentConfig, GenerateContentConfig
 # Config CENTRAL de embeddings (mismo modelo/dims que generar_embeddings.py).
 from config_emb import MODELO_EMB, OUTPUT_DIM, recortar, normalizar
+# Chequeo de fidelidad de citas (determinista, sin LLM).
+from citas import verificar_citas
 
 # ===================== CONFIGURACION =====================
 PROJECT_ID = "project-a0134db0-3990-4ec2-bc3"
@@ -595,7 +597,9 @@ def construir_contexto(filas):
     return "\n\n".join(bloques)
 
 
-def responder(pregunta, k=TOP_K, modelo=MODELO_GEN):
+def responder(pregunta, k=TOP_K, modelo=MODELO_GEN, temperatura=0.2):
+    """Recupera + genera. `temperatura` por defecto 0.2 (produccion); el harness de
+    evaluacion puede fijar 0 para reproducibilidad sin alterar el default."""
     filas = recuperar(consultas_busqueda(pregunta), k)
     if not filas:
         return "No se encontraron fragmentos normativos relevantes.", []
@@ -615,11 +619,14 @@ def responder(pregunta, k=TOP_K, modelo=MODELO_GEN):
             contents=prompt,
             config=GenerateContentConfig(
                 system_instruction=INSTRUCCION_SISTEMA,
-                temperature=0.2,
+                temperature=temperatura,
             ),
         ),
         etiqueta="generacion")
-    return resp.text, filas
+    chequeo = verificar_citas(resp.text, len(filas))
+    if not chequeo["ok"]:
+        print(f"[!] Citas inventadas neutralizadas: {chequeo['citas_invalidas']}")
+    return chequeo["respuesta_limpia"], filas
 
 
 def main():

@@ -25,9 +25,15 @@
 !responder.py
 !reset_corpus.py
 !config_emb.py
+!citas.py
 
 # Aplicacion web (API + UI) y despliegue
 !app.py
 !Dockerfile
 !requirements.txt
 !desplegar_cloudrun.ps1
+
+# Evaluacion (harness + dataset; los reportes generados NO se versionan)
+!eval/
+!eval/run_eval.py
+!eval/casos.jsonl

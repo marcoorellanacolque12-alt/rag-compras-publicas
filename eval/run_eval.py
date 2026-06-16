@@ -30,9 +30,8 @@ from datetime import datetime, timezone
 # Importar los modulos del proyecto (carpeta padre) sin duplicar constantes.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from responder import (recuperar, consultas_busqueda, responder, doc_label,  # noqa: E402
+from responder import (recuperar, consultas_busqueda, generar_respuesta, doc_label,  # noqa: E402
                        cliente, MODELO_GEN)
-from citas import verificar_citas  # noqa: E402
 from google.genai.types import GenerateContentConfig  # noqa: E402
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -72,18 +71,21 @@ def ev_recall(caso, k, temp, juez):
 
 
 def ev_fidelidad(caso, k, temp, juez):
-    texto, filas = responder(caso["pregunta"], k=k, temperatura=temp)
-    chk = verificar_citas(texto, len(filas))
-    res = {"ok": chk["ok"], "citas_validas": chk["citas_validas"],
-           "citas_invalidas": chk["citas_invalidas"], "n_filas": len(filas), "pass": chk["ok"]}
+    # MISMA ruta que produccion: recupera en modo general y genera con generar_respuesta.
+    filas = recuperar(consultas_busqueda(caso["pregunta"]), k=k)
+    r = generar_respuesta(caso["pregunta"], filas, modo="general", temperatura=temp)
+    ok = not r["citas_invalidas"]   # citas calculadas sobre la salida CRUDA del modelo
+    res = {"ok": ok, "citas_validas": r["citas_validas"],
+           "citas_invalidas": r["citas_invalidas"], "n_filas": len(filas), "pass": ok}
     if juez:
-        res["juez"] = _juez_fidelidad(caso["pregunta"], chk["respuesta_limpia"], filas, chk["citas_validas"])
+        res["juez"] = _juez_fidelidad(caso["pregunta"], r["respuesta"], filas, r["citas_validas"])
     return res
 
 
 def ev_frontera(caso, k, temp, juez):
-    texto, filas = responder(caso["pregunta"], k=k, temperatura=temp)
-    declino = _declino(texto)
+    filas = recuperar(consultas_busqueda(caso["pregunta"]), k=k)
+    r = generar_respuesta(caso["pregunta"], filas, modo="general", temperatura=temp)
+    declino = _declino(r["respuesta"])
     esperado = caso.get("esperado")
     if esperado == "debe_declinar":
         clase = "declinacion_correcta" if declino else "alucinacion"

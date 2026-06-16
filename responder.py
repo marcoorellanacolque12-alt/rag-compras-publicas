@@ -31,7 +31,7 @@ import threading
 import collections
 from google.cloud import bigquery
 from google import genai
-from google.genai.types import EmbedContentConfig, GenerateContentConfig
+from google.genai.types import EmbedContentConfig, GenerateContentConfig, Content, Part
 # Config CENTRAL de embeddings (mismo modelo/dims que generar_embeddings.py).
 from config_emb import MODELO_EMB, OUTPUT_DIM, recortar, normalizar
 # Chequeo de fidelidad de citas (determinista, sin LLM).
@@ -597,36 +597,173 @@ def construir_contexto(filas):
     return "\n\n".join(bloques)
 
 
-def responder(pregunta, k=TOP_K, modelo=MODELO_GEN, temperatura=0.2):
-    """Recupera + genera. `temperatura` por defecto 0.2 (produccion); el harness de
-    evaluacion puede fijar 0 para reproducibilidad sin alterar el default."""
-    filas = recuperar(consultas_busqueda(pregunta), k)
-    if not filas:
-        return "No se encontraron fragmentos normativos relevantes.", []
+# ===================================================================
+# GENERACION UNIFICADA — fuente unica compartida por el endpoint (/api/chat),
+# el CLI (responder()) y el harness (eval/). Movida desde app.py para que el
+# eval mida EXACTAMENTE el prompt que se envia a produccion.
+# ===================================================================
+MAX_TURNOS_HISTORIAL = 12          # turnos de historial inyectados al modelo
 
-    contexto = construir_contexto(filas)
-    # EL CANDADO: el guardrail va como system_instruction Y antepuesto al contexto
-    # (consistente con la web). Mismo texto innegociable.
-    prompt = (
-        GUARDRAIL_CONSULTA_GENERAL + "\n\n"
-        f"FRAGMENTOS NORMATIVOS:\n{contexto}\n\n"
-        f"PREGUNTA DEL USUARIO:\n{pregunta}\n\n"
-        f"Redacta la respuesta siguiendo las reglas, citando los articulos."
+# Instruccion de formato de CITAS (se AÑADE al prompt; no reemplaza el guardrail).
+INSTRUCCION_CITAS = (
+    "FORMATO DE CITAS: tras cada afirmacion, coloca el marcador [N] (por ejemplo [1], [2]) "
+    "del/los fragmento(s) de NORMAS RECUPERADAS que la respaldan. Usa solo numeros de "
+    "fragmentos existentes; no inventes marcadores."
+)
+
+# Instruccion de PRECISION (se AÑADE; NO modifica el texto anti-alucinaciones del guardrail).
+# Evita el "no dispongo" falso cuando la cita del usuario es imprecisa pero el contexto SI
+# contiene la norma: en ese caso responde y aclara la referencia correcta.
+INSTRUCCION_PRECISION = (
+    "PRECISION Y ALCANCE: responde UNICAMENTE con la informacion del contexto. Si el usuario "
+    "cita un articulo o una norma de forma imprecisa (por ejemplo, atribuye un tema al "
+    "Reglamento cuando el contexto lo regula en la Ley, o viceversa) pero el contexto SI "
+    "contiene la norma pertinente, RESPONDE con base en el contexto y ACLARA la referencia "
+    "correcta (que norma y articulo lo regulan). Recurre a la frase de que no dispones de la "
+    "informacion SOLO cuando el contexto realmente no la contenga."
+)
+
+# Instruccion de ESTRUCTURA de la respuesta (ADITIVA; el guardrail no se toca).
+INSTRUCCION_ESTRUCTURA = (
+    "ESTRUCTURA DE LA RESPUESTA: comienza con una apertura DIRECTA de 1-2 frases que responda "
+    "la pregunta. Si hay varias reglas, supuestos o condiciones, desarrollalas despues en "
+    "puntos o numeracion (una idea por punto). Cierra indicando la referencia normativa "
+    "principal que sustenta la respuesta."
+)
+
+# Instruccion de CRUCE Ley<->Reglamento ANCLADO al contexto (ADITIVA).
+INSTRUCCION_CRUCE = (
+    "CRUCE LEY-REGLAMENTO (OBLIGATORIO): revisa TODOS los fragmentos del contexto. Si ademas "
+    "del articulo de la Ley que responde la pregunta hay articulos del Reglamento (u otras "
+    "normas) que desarrollan ese mismo tema, DEBES mencionarlos en la respuesta, indicando la "
+    "relacion explicitamente (por ejemplo: 'regulado en el art. X de la Ley [n] y desarrollado "
+    "en los arts. Y [n] y Z [n] del Reglamento') y citando cada uno con su marcador [N]. "
+    "REGLA DURA: solo puedes cruzar normas PRESENTES en el contexto recuperado; NUNCA cites "
+    "articulos o normas de memoria. Si el desarrollo reglamentario no esta en el contexto, "
+    "no lo inventes ni lo insinues."
+)
+
+
+def _sistema_consulta_general():
+    """Guardrail estricto (cero alucinaciones) para el chat global sin caso."""
+    return GUARDRAIL_CONSULTA_GENERAL
+
+
+def _sistema_chat():
+    return (
+        "Eres un asistente experto en contrataciones publicas. Respondes consultas de areas "
+        "usuarias, especialistas y operadores. Reglas:\n"
+        "1. Usa como contexto los DOCUMENTOS DEL CASO (fuentes activas) y las NORMAS RECUPERADAS "
+        "del marco legal. No uses conocimiento externo.\n"
+        "2. Si la respuesta no esta en el contexto, dilo claramente: no inventes.\n"
+        "3. Cita SIEMPRE el respaldo: articulos (ej: Reglamento, Art. 304) y/o la fuente del caso.\n"
+        "4. Lenguaje claro y preciso; enumera plazos, montos o pasos cuando aplique."
     )
+
+
+def _sistema_auditoria(etiquetas):
+    etiquetas_txt = ", ".join(etiquetas) if etiquetas else "(sin etiquetas especificas)"
+    return (
+        "Eres un especialista legal en contrataciones publicas. Analiza el/los documento(s) "
+        "adjunto(s) (fuentes activas) teniendo en cuenta que el usuario los ha clasificado con "
+        f"las siguientes etiquetas de control: {etiquetas_txt}. Cruza el texto con las normas "
+        "recuperadas e identifica riesgos, omisiones o alertas especificas que afecten a los "
+        "criterios de esas etiquetas bajo el marco de la Ley 32069. Estructura la respuesta por "
+        "etiqueta, cita los articulos de respaldo (ej: Reglamento, Art. 304) y se claro y "
+        "accionable. Si algo no puede verificarse con las normas recuperadas, indicalo."
+    )
+
+
+def _ensamblar_prompt(pregunta, filas, modo, contexto_fuentes, etiquetas):
+    """Arma (system_instruction, prompt) EXACTAMENTE como el endpoint /api/chat de hoy,
+    segun el modo (general / chat / analisis). Pura, SIN red: es la base verificable de
+    la no-regresion del endpoint."""
+    contexto_normas = construir_contexto(filas) if filas else "(sin normas recuperadas)"
+    if modo == "general":
+        # EL CANDADO: el guardrail va como system_instruction Y antepuesto al contexto.
+        prompt = (
+            GUARDRAIL_CONSULTA_GENERAL + "\n\n"
+            "CONTEXTO NORMATIVO PROPORCIONADO (unica fuente de verdad):\n"
+            + contexto_normas + "\n\n"
+            + INSTRUCCION_PRECISION + "\n\n"
+            + INSTRUCCION_ESTRUCTURA + "\n\n"
+            + INSTRUCCION_CRUCE + "\n\n"
+            + INSTRUCCION_CITAS + "\n\n"
+            "CONSULTA DEL USUARIO:\n" + pregunta
+        )
+        return _sistema_consulta_general(), prompt
+
+    # ===== modos de CASO: chat / analisis =====
+    secciones = [f"NORMAS RECUPERADAS (base vectorial):\n{contexto_normas}"]
+    if contexto_fuentes:
+        secciones.append("DOCUMENTOS DEL CASO (fuentes activas seleccionadas por el usuario):\n"
+                         + contexto_fuentes)
+    else:
+        secciones.append("DOCUMENTOS DEL CASO: (ninguna fuente activa en este turno).")
+
+    if modo == "analisis":
+        sistema = _sistema_auditoria(etiquetas)
+        secciones.append("TAREA: Realiza la auditoria legal de las fuentes activas segun las "
+                         "instrucciones del sistema." +
+                         (f"\nFoco adicional del usuario: {pregunta}" if pregunta else ""))
+    else:
+        sistema = _sistema_chat()
+        secciones.append(f"CONSULTA DEL USUARIO:\n{pregunta or '(resume y comenta las fuentes activas)'}")
+
+    secciones.append(INSTRUCCION_PRECISION)
+    secciones.append(INSTRUCCION_ESTRUCTURA)
+    secciones.append(INSTRUCCION_CRUCE)
+    secciones.append(INSTRUCCION_CITAS)
+    return sistema, "\n\n".join(secciones)
+
+
+def _construir_contents(prompt, historial):
+    """Historial multi-turno con roles nativos (user/model) + el prompt final como turno
+    de usuario. Identico a la logica previa de _responder_llm (app.py)."""
+    contents = []
+    for t in list(historial)[-MAX_TURNOS_HISTORIAL:]:
+        rol = "model" if (getattr(t, "rol", "") or "").lower() in ("model", "assistant", "ia", "bot") else "user"
+        txt = (getattr(t, "texto", "") or "").strip()
+        if txt:
+            contents.append(Content(role=rol, parts=[Part(text=txt)]))
+    while contents and contents[0].role == "model":
+        contents.pop(0)
+    contents.append(Content(role="user", parts=[Part(text=prompt)]))
+    return contents
+
+
+def generar_respuesta(pregunta, filas, *, modo="general", contexto_fuentes="",
+                      etiquetas=(), historial=(), temperatura=0.2, modelo=MODELO_GEN):
+    """Funcion UNICA de generacion: la usan el endpoint /api/chat, el CLI y el eval.
+    Arma el prompt + system_instruction EXACTAMENTE como /api/chat en los 3 modos
+    (general / chat / analisis), inyecta historial con roles nativos, genera con
+    temperatura parametrizable (0.2 = produccion) y pasa la salida por verificar_citas.
+    Devuelve {"respuesta", "citas_validas", "citas_invalidas"}."""
+    sistema, prompt = _ensamblar_prompt(pregunta, filas, modo, contexto_fuentes, etiquetas)
+    contents = _construir_contents(prompt, historial)
     resp = con_reintentos(
         lambda: cliente().models.generate_content(
-            model=modelo,
-            contents=prompt,
-            config=GenerateContentConfig(
-                system_instruction=INSTRUCCION_SISTEMA,
-                temperature=temperatura,
-            ),
+            model=modelo, contents=contents,
+            config=GenerateContentConfig(system_instruction=sistema, temperature=temperatura),
         ),
         etiqueta="generacion")
     chequeo = verificar_citas(resp.text, len(filas))
-    if not chequeo["ok"]:
-        print(f"[!] Citas inventadas neutralizadas: {chequeo['citas_invalidas']}")
-    return chequeo["respuesta_limpia"], filas
+    return {"respuesta": chequeo["respuesta_limpia"],
+            "citas_validas": chequeo["citas_validas"],
+            "citas_invalidas": chequeo["citas_invalidas"]}
+
+
+def responder(pregunta, k=TOP_K, modelo=MODELO_GEN, temperatura=0.2):
+    """RAG por CLI: recupera en modo general y genera con la funcion UNIFICADA
+    (mismo prompt que el endpoint). `temperatura` 0.2 por defecto (produccion); el eval
+    puede fijar 0 sin alterar el default. Devuelve (respuesta_limpia, filas)."""
+    filas = recuperar(consultas_busqueda(pregunta), k)
+    if not filas:
+        return "No se encontraron fragmentos normativos relevantes.", []
+    res = generar_respuesta(pregunta, filas, modo="general", temperatura=temperatura, modelo=modelo)
+    if res["citas_invalidas"]:
+        print(f"[!] Citas inventadas neutralizadas: {res['citas_invalidas']}")
+    return res["respuesta"], filas
 
 
 def main():

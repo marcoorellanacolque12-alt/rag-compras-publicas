@@ -63,8 +63,8 @@ from responder import (
     GUARDRAIL_CONSULTA_GENERAL, consultas_busqueda,
     embeber_para_indexar, indexar_chunks, eliminar_por_prefijo,
     con_reintentos, doc_label, listar_normas, formato_cita,
+    generar_respuesta,   # generacion UNIFICADA (prompt+system identicos en endpoint/CLI/eval)
 )
-from citas import verificar_citas   # fidelidad de citas (neutraliza [N] inventados)
 # Motores de extraccion (en memoria): PDF+OCR, DOCX, Excel/CSV->Markdown, imagen->OCR.
 from extraccion_texto import (
     extraer_pdf_inteligente, extraer_docx,
@@ -122,46 +122,9 @@ os.makedirs(ARCHIVOS_BIBLIOTECA, exist_ok=True)
 
 MAX_CONTEXT_CHARS = 200_000        # tope de texto de fuentes activas enviado al LLM
 QUERY_DOC_CHARS = 3_000            # extracto para construir la consulta de recuperacion
-MAX_TURNOS_HISTORIAL = 12          # turnos de historial inyectados al modelo
-
-# Instruccion de formato de CITAS (se AÑADE al prompt; no reemplaza el guardrail).
-INSTRUCCION_CITAS = (
-    "FORMATO DE CITAS: tras cada afirmacion, coloca el marcador [N] (por ejemplo [1], [2]) "
-    "del/los fragmento(s) de NORMAS RECUPERADAS que la respaldan. Usa solo numeros de "
-    "fragmentos existentes; no inventes marcadores."
-)
-
-# Instruccion de PRECISION (se AÑADE; NO modifica el texto anti-alucinaciones del guardrail).
-# Evita el "no dispongo" falso cuando la cita del usuario es imprecisa pero el contexto SI
-# contiene la norma: en ese caso responde y aclara la referencia correcta.
-INSTRUCCION_PRECISION = (
-    "PRECISION Y ALCANCE: responde UNICAMENTE con la informacion del contexto. Si el usuario "
-    "cita un articulo o una norma de forma imprecisa (por ejemplo, atribuye un tema al "
-    "Reglamento cuando el contexto lo regula en la Ley, o viceversa) pero el contexto SI "
-    "contiene la norma pertinente, RESPONDE con base en el contexto y ACLARA la referencia "
-    "correcta (que norma y articulo lo regulan). Recurre a la frase de que no dispones de la "
-    "informacion SOLO cuando el contexto realmente no la contenga."
-)
-
-# Instruccion de ESTRUCTURA de la respuesta (ADITIVA; el guardrail no se toca).
-INSTRUCCION_ESTRUCTURA = (
-    "ESTRUCTURA DE LA RESPUESTA: comienza con una apertura DIRECTA de 1-2 frases que responda "
-    "la pregunta. Si hay varias reglas, supuestos o condiciones, desarrollalas despues en "
-    "puntos o numeracion (una idea por punto). Cierra indicando la referencia normativa "
-    "principal que sustenta la respuesta."
-)
-
-# Instruccion de CRUCE Ley<->Reglamento ANCLADO al contexto (ADITIVA).
-INSTRUCCION_CRUCE = (
-    "CRUCE LEY-REGLAMENTO (OBLIGATORIO): revisa TODOS los fragmentos del contexto. Si ademas "
-    "del articulo de la Ley que responde la pregunta hay articulos del Reglamento (u otras "
-    "normas) que desarrollan ese mismo tema, DEBES mencionarlos en la respuesta, indicando la "
-    "relacion explicitamente (por ejemplo: 'regulado en el art. X de la Ley [n] y desarrollado "
-    "en los arts. Y [n] y Z [n] del Reglamento') y citando cada uno con su marcador [N]. "
-    "REGLA DURA: solo puedes cruzar normas PRESENTES en el contexto recuperado; NUNCA cites "
-    "articulos o normas de memoria. Si el desarrollo reglamentario no esta en el contexto, "
-    "no lo inventes ni lo insinues."
-)
+# La generacion unificada (MAX_TURNOS_HISTORIAL, INSTRUCCION_*, builders _sistema_* y la
+# funcion generar_respuesta que arma prompt + system_instruction) vive ahora en responder.py.
+# El CLI y el eval convergen hacia el MISMO armado que usa este endpoint.
 # ========================================================
 
 
@@ -743,32 +706,6 @@ def _procesar_biblioteca(bid, nombre, data, categoria, anio, vigente):
         actualizar_biblio(bid, estado="error", error=f"{type(e).__name__}: {e}")
 
 
-def _sistema_consulta_general():
-    """Guardrail estricto (cero alucinaciones) para el chat global sin caso."""
-    return GUARDRAIL_CONSULTA_GENERAL
-
-
-def _responder_llm(sistema, prompt, historial):
-    """Inyecta historial multi-turno (roles nativos) + prompt final y llama a Gemini."""
-    contents = []
-    for t in historial[-MAX_TURNOS_HISTORIAL:]:
-        rol = "model" if (t.rol or "").lower() in ("model", "assistant", "ia", "bot") else "user"
-        txt = (t.texto or "").strip()
-        if txt:
-            contents.append(Content(role=rol, parts=[Part(text=txt)]))
-    while contents and contents[0].role == "model":
-        contents.pop(0)
-    contents.append(Content(role="user", parts=[Part(text=prompt)]))
-
-    resp = con_reintentos(
-        lambda: cliente().models.generate_content(
-            model=MODELO_GEN, contents=contents,
-            config=GenerateContentConfig(system_instruction=sistema, temperature=0.2),
-        ),
-        etiqueta="generacion")
-    return resp.text
-
-
 def _historial_texto(historial, n=4):
     """Ultimos n turnos como texto plano, para REFORMULAR la consulta (resolver
     follow-ups). Es la misma conversacion en curso; no requiere base de datos."""
@@ -793,31 +730,6 @@ def _mensaje_error_llm(e):
         return ("La respuesta fue bloqueada por los filtros de seguridad del modelo. "
                 "Reformula la consulta.")
     return f"No se pudo generar la respuesta ({type(e).__name__}). Inténtalo nuevamente."
-
-
-def _sistema_chat():
-    return (
-        "Eres un asistente experto en contrataciones publicas. Respondes consultas de areas "
-        "usuarias, especialistas y operadores. Reglas:\n"
-        "1. Usa como contexto los DOCUMENTOS DEL CASO (fuentes activas) y las NORMAS RECUPERADAS "
-        "del marco legal. No uses conocimiento externo.\n"
-        "2. Si la respuesta no esta en el contexto, dilo claramente: no inventes.\n"
-        "3. Cita SIEMPRE el respaldo: articulos (ej: Reglamento, Art. 304) y/o la fuente del caso.\n"
-        "4. Lenguaje claro y preciso; enumera plazos, montos o pasos cuando aplique."
-    )
-
-
-def _sistema_auditoria(etiquetas):
-    etiquetas_txt = ", ".join(etiquetas) if etiquetas else "(sin etiquetas especificas)"
-    return (
-        "Eres un especialista legal en contrataciones publicas. Analiza el/los documento(s) "
-        "adjunto(s) (fuentes activas) teniendo en cuenta que el usuario los ha clasificado con "
-        f"las siguientes etiquetas de control: {etiquetas_txt}. Cruza el texto con las normas "
-        "recuperadas e identifica riesgos, omisiones o alertas especificas que afecten a los "
-        "criterios de esas etiquetas bajo el marco de la Ley 32069. Estructura la respuesta por "
-        "etiqueta, cita los articulos de respaldo (ej: Reglamento, Art. 304) y se claro y "
-        "accionable. Si algo no puede verificarse con las normas recuperadas, indicalo."
-    )
 
 
 # ============================ ENDPOINTS ============================
@@ -1035,31 +947,16 @@ def chat(m: Mensaje):
 
         hist_txt = _historial_texto(m.historial)
         filas = recuperar(consultas_busqueda(pregunta, hist_txt), k=m.k, filtros=filtros)
-        contexto_normas = construir_contexto(filas) if filas else "(sin normas recuperadas)"
-
-        # EL CANDADO: la instruccion estricta va como system_instruction Y, ademas,
-        # se antepone explicitamente al contexto recuperado dentro del prompt.
-        prompt = (
-            GUARDRAIL_CONSULTA_GENERAL + "\n\n"
-            "CONTEXTO NORMATIVO PROPORCIONADO (unica fuente de verdad):\n"
-            + contexto_normas + "\n\n"
-            + INSTRUCCION_PRECISION + "\n\n"
-            + INSTRUCCION_ESTRUCTURA + "\n\n"
-            + INSTRUCCION_CRUCE + "\n\n"
-            + INSTRUCCION_CITAS + "\n\n"
-            "CONSULTA DEL USUARIO:\n" + pregunta
-        )
         try:
-            respuesta = _responder_llm(_sistema_consulta_general(), prompt, m.historial)
+            res = generar_respuesta(pregunta, filas, modo="general", historial=m.historial)
         except Exception as e:
             return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
-        chequeo = verificar_citas(respuesta, len(filas))   # neutraliza [N] inventados
         return {
-            "respuesta": chequeo["respuesta_limpia"],
+            "respuesta": res["respuesta"],
             "modo": "general",
             "fuentes_usadas": [],
             "fuentes_normativas": _fuentes_normativas(filas),
-            "citas_invalidas": chequeo["citas_invalidas"],
+            "citas_invalidas": res["citas_invalidas"],
         }
 
     # ===== CHAT / ANALISIS dentro de un caso =====
@@ -1088,43 +985,21 @@ def chat(m: Mensaje):
     qs = consultas_busqueda(base_query, _historial_texto(m.historial))
     consultas = [f"{q}\n{extracto}".strip() for q in qs] or ([extracto] if extracto else [])
     filas = recuperar(consultas, k=m.k, filtros=filtros) if consultas else []
-    contexto_normas = construir_contexto(filas) if filas else "(sin normas recuperadas)"
 
-    secciones = [f"NORMAS RECUPERADAS (base vectorial):\n{contexto_normas}"]
-    if contexto_fuentes:
-        secciones.append("DOCUMENTOS DEL CASO (fuentes activas seleccionadas por el usuario):\n"
-                         + contexto_fuentes)
-    else:
-        secciones.append("DOCUMENTOS DEL CASO: (ninguna fuente activa en este turno).")
-
-    if m.modo == "analisis":
-        sistema = _sistema_auditoria(etiquetas)
-        secciones.append("TAREA: Realiza la auditoria legal de las fuentes activas segun las "
-                         "instrucciones del sistema." +
-                         (f"\nFoco adicional del usuario: {pregunta}" if pregunta else ""))
-    else:
-        sistema = _sistema_chat()
-        secciones.append(f"CONSULTA DEL USUARIO:\n{pregunta or '(resume y comenta las fuentes activas)'}")
-
-    secciones.append(INSTRUCCION_PRECISION)
-    secciones.append(INSTRUCCION_ESTRUCTURA)
-    secciones.append(INSTRUCCION_CRUCE)
-    secciones.append(INSTRUCCION_CITAS)
-    prompt = "\n\n".join(secciones)
-
-    # MEMORIA MULTI-TURNO + generacion (helper compartido con la Consulta General).
+    # Armado + generacion UNIFICADOS (mismo prompt/system que antes vivia inline aqui).
+    modo = "analisis" if m.modo == "analisis" else "chat"
     try:
-        respuesta = _responder_llm(sistema, prompt, m.historial)
+        res = generar_respuesta(pregunta, filas, modo=modo, contexto_fuentes=contexto_fuentes,
+                                etiquetas=etiquetas, historial=m.historial)
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
-    chequeo = verificar_citas(respuesta, len(filas))   # neutraliza [N] inventados
     return {
-        "respuesta": chequeo["respuesta_limpia"],
+        "respuesta": res["respuesta"],
         "modo": m.modo,
         "fuentes_usadas": [{"id": f["id"], "nombre": f["nombre"]} for f in activos],
         "fuentes_normativas": _fuentes_normativas(filas),
-        "citas_invalidas": chequeo["citas_invalidas"],
+        "citas_invalidas": res["citas_invalidas"],
     }
 
 

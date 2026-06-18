@@ -37,3 +37,7 @@
 !eval/
 !eval/run_eval.py
 !eval/casos.jsonl
+
+# Tests
+!tests/
+!tests/test_prompt_golden.py

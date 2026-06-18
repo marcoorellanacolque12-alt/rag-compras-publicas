@@ -1284,13 +1284,11 @@ HTML = r"""
       <div class="flex items-end gap-2 max-w-[56rem] mx-auto w-full">
         <textarea id="q" rows="1" placeholder="Entra a un caso para chatear..."
                   class="flex-1 resize-none bg-slate-800 border border-slate-700 text-slate-100 placeholder-slate-500 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 disabled:opacity-50"
-                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();enviar('chat');}"></textarea>
-        <button id="btnChat" onclick="enviar('chat')"
-                class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition disabled:opacity-40 disabled:cursor-not-allowed">Enviar</button>
-        <button id="btnAnal" onclick="enviar('analisis')"
-                class="border border-slate-600 hover:bg-slate-800 text-slate-200 text-sm font-medium rounded-lg px-4 py-2 transition whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed">Análisis legal</button>
+                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();enviar();}"></textarea>
+        <button id="btnChat" onclick="enviar()"
+                class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition disabled:opacity-40 disabled:cursor-not-allowed">Analizar</button>
       </div>
-      <p id="ayudaChat" class="text-[11px] text-slate-500 mt-1.5 max-w-[56rem] mx-auto w-full">"Enviar" = pregunta · "Análisis legal" = auditoría de las fuentes activas guiada por sus etiquetas.</p>
+      <p id="ayudaChat" class="text-[11px] text-slate-500 mt-1.5 max-w-[56rem] mx-auto w-full">Con una pregunta, responde apoyado en las fuentes del caso y el marco legal. Sin pregunta, analiza las fuentes activas.</p>
     </div>
   </main>
 
@@ -1299,7 +1297,7 @@ HTML = r"""
     <div class="flex items-start justify-between gap-2 px-5 py-4 border-b border-slate-800/70">
       <div class="min-w-0">
         <h2 class="text-sm font-semibold text-slate-100">Marco normativo</h2>
-        <p class="text-[11px] text-slate-500 mt-0.5">Filtros y selección de normas para la Consulta General.</p>
+        <p class="text-[11px] text-slate-500 mt-0.5">Filtros y selección de normas (acota el marco legal en consultas y casos).</p>
       </div>
       <button onclick="togglePanelNormativo(false)" title="Ocultar panel"
               class="flex-none text-slate-500 hover:text-slate-200 text-lg leading-none">&times;</button>
@@ -1611,7 +1609,7 @@ async function borrarCaso(c){
 
 // =================== ENTRAR / SALIR DE UN CASO ===================
 function setChat(enabled){
-  ['q','btnChat','btnAnal','btnLimpiar'].forEach(id=>document.getElementById(id).disabled = !enabled);
+  ['q','btnChat','btnLimpiar'].forEach(id=>document.getElementById(id).disabled = !enabled);
   document.getElementById('q').placeholder = enabled ? 'Escribe tu consulta...' : 'Entra a un caso para chatear...';
 }
 function resetChatUI(msg){
@@ -1623,20 +1621,19 @@ function resetChatUI(msg){
 function marcarModoUI(){
   const badge = document.getElementById('badgeEstricto');
   const btnG = document.getElementById('btnConsultaGeneral');
-  const btnAnal = document.getElementById('btnAnal');
   const ayuda = document.getElementById('ayudaChat');
-  // Barra de filtros normativos: solo en Consulta General (display inline = sin choque de cascade).
+  // Filtros + seleccion de normas (Biblioteca): se usan en AMBOS modos (Consulta General
+  // y dentro de un caso) para acotar la busqueda vectorial. display inline = sin choque de cascade.
   const fb = document.getElementById('filtrosBar');
-  if(fb) fb.style.display = modoGeneral ? 'flex' : 'none';
+  if(fb) fb.style.display = 'flex';
   if(modoGeneral){
     badge.classList.remove('hidden-x'); badge.classList.add('inline-flex');
     btnG.classList.add('ring-2','ring-emerald-300');
-    btnAnal.disabled = true;  // el análisis legal requiere fuentes de un caso
     ayuda.innerHTML = '🔒 <b>Consulta General (modo estricto):</b> el asistente responde únicamente desde el marco normativo cargado; si no está, lo declara expresamente.';
   } else {
     badge.classList.add('hidden-x'); badge.classList.remove('inline-flex');
     btnG.classList.remove('ring-2','ring-emerald-300');
-    ayuda.innerHTML = '"Enviar" = pregunta · "Ejecutar Análisis Legal" = auditoría de las fuentes activas guiada por sus etiquetas.';
+    ayuda.innerHTML = 'Con una pregunta, responde apoyado en las fuentes del caso y el marco legal. Sin pregunta, analiza las fuentes activas.';
   }
 }
 async function entrarCaso(c){
@@ -1646,6 +1643,7 @@ async function entrarCaso(c){
   document.getElementById('casoEnChat').textContent = c.nombre;
   mostrarVista('caso');   // muestra vista-detalle-caso, oculta vista-repositorio
   setChat(true); marcarModoUI();
+  cargarNormas();   // expone la seleccion individual de normas de la Biblioteca tambien en el caso
   resetChatUI('Estás en el caso <b>'+esc(c.nombre)+'</b>. Sube documentos, actívalos y pregúntame. El chat y las fuentes son exclusivos de este caso.');
   // Cargar fuentes del caso (aislado).
   try{
@@ -2027,11 +2025,12 @@ function marcarNormas(val){
 function leerFiltros(){
   const sel = document.getElementById('filtroCategorias');
   const cats = sel ? Array.from(sel.selectedOptions).map(o=>o.value) : [];
-  // Seleccion individual de normas: solo en Consulta General y si ya se cargaron.
-  // null = sin restriccion (robusto); [] = ninguna seleccionada (busca en cero normas).
+  // Seleccion individual de normas (Biblioteca): aplica en AMBOS modos (caso y general),
+  // si ya se cargaron las normas. null = sin restriccion (robusto); lista = solo esas;
+  // [] = ninguna seleccionada (busca en cero normas).
   const ni = document.querySelectorAll('#filtroNormas input[type=checkbox]');
   let normas = null;
-  if(modoGeneral && ni.length){
+  if(ni.length){
     normas = Array.from(ni).filter(i=>i.checked).map(i=>i.value);
   }
   return {
@@ -2041,27 +2040,28 @@ function leerFiltros(){
     normas: normas,
   };
 }
-async function enviar(modo){
+async function enviar(){
   if(!casoActual && !modoGeneral){ return; }
   const q = document.getElementById('q');
   const texto = q.value.trim();
   const activas = modoGeneral ? [] : fuentes.filter(f=>f.activo && (f.estado||'listo')==='listo').map(f=>f.id);
-  if(modoGeneral && modo==='analisis'){ addMsg('El Análisis Legal requiere entrar a un caso con fuentes activas. En Consulta General usa "Enviar".', 'bot'); return; }
+  // Guards: en general se exige pregunta; en un caso, pregunta O al menos una fuente activa.
   if(modoGeneral && !texto){ return; }
-  if(modo==='chat' && !texto && !activas.length){ return; }
-  if(modo==='analisis' && !activas.length){ addMsg('Activa al menos una fuente (lista) para ejecutar el análisis legal.', 'bot'); return; }
+  if(!modoGeneral && !texto && !activas.length){
+    addMsg('Escribe una consulta o activa al menos una fuente del caso.', 'bot'); return;
+  }
 
-  const userTxt = texto || (modo==='analisis' ? '[Solicitud de análisis legal de las fuentes activas]' : '');
+  const userTxt = texto;   // sin pregunta = analisis libre de las fuentes (fallback del backend)
   if(texto) addMsg(esc(texto), 'user');
-  else if(modo==='analisis') addMsg('<i>Ejecutar análisis legal de las fuentes activas</i>', 'user');
+  else addMsg('<i>Analizar las fuentes activas</i>', 'user');
   q.value='';
-  document.getElementById('btnChat').disabled=true; document.getElementById('btnAnal').disabled=true;
+  document.getElementById('btnChat').disabled=true;
   const cargandoMsg = modoGeneral ? 'Consultando el marco normativo (modo estricto)...' : 'Analizando con las fuentes activas y la normativa...';
   const cargando = addMsg('<span class="text-slate-400 italic">'+cargandoMsg+'</span>', 'bot');
   try{
     const r = await fetchConTimeout('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({caso_id: casoActual ? casoActual.id : '', general: modoGeneral,
-                            pregunta: texto, fuentes_activas: activas, modo: modo, k: 5,
+                            pregunta: texto, fuentes_activas: activas, modo: 'chat', k: 5,
                             historial: historial.slice(-MAX_HIST_CLIENTE),
                             filtros: leerFiltros()})}, 180000);
     let d = {}; try { d = await r.json(); } catch(_){ d = {}; }
@@ -2093,7 +2093,7 @@ async function enviar(modo){
     if(e && e.name==='AbortError'){ cargando.innerHTML = '<span class="text-amber-700">La consulta tardó demasiado y se canceló (timeout).</span>'; }
     else { cargando.innerHTML = '<span class="text-amber-700">Error: '+esc(String(e))+'</span>'; }
   }
-  finally{ document.getElementById('btnChat').disabled=false; document.getElementById('btnAnal').disabled=false; chat.scrollTop=chat.scrollHeight; }
+  finally{ document.getElementById('btnChat').disabled=false; chat.scrollTop=chat.scrollHeight; }
 }
 
 // =================== INIT ===================

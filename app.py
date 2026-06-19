@@ -177,6 +177,26 @@ def _init_db():
                 error          TEXT,
                 fecha_creacion TEXT NOT NULL
             )""")
+        # Conversaciones persistentes (solo dentro de un caso). Se borran en cascada con el caso.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS conversaciones (
+                id                  TEXT PRIMARY KEY,
+                caso_id             TEXT NOT NULL,
+                titulo              TEXT,
+                fecha_creacion      TEXT NOT NULL,
+                fecha_actualizacion TEXT NOT NULL,
+                FOREIGN KEY (caso_id) REFERENCES casos(id) ON DELETE CASCADE
+            )""")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS mensajes (
+                id              TEXT PRIMARY KEY,
+                conversacion_id TEXT NOT NULL,
+                rol             TEXT NOT NULL,          -- user | model
+                texto           TEXT,
+                meta            TEXT,                   -- JSON: fuentes_normativas/fuentes_usadas (rol model)
+                fecha_creacion  TEXT NOT NULL,
+                FOREIGN KEY (conversacion_id) REFERENCES conversaciones(id) ON DELETE CASCADE
+            )""")
         con.commit()
     finally:
         con.close()
@@ -216,6 +236,88 @@ def caso_existe(cid):
         return con.execute("SELECT 1 FROM casos WHERE id=?", (cid,)).fetchone() is not None
     finally:
         con.close()
+
+
+# --- Conversaciones (chat persistente por caso) ---
+def crear_conversacion(caso_id, titulo=""):
+    conv = uuid.uuid4().hex[:12]
+    ts = _ahora()
+    titulo = (titulo or "").strip()[:60] or "Nueva conversación"
+    with _db_lock:
+        con = _conn()
+        try:
+            con.execute("INSERT INTO conversaciones (id, caso_id, titulo, fecha_creacion, "
+                        "fecha_actualizacion) VALUES (?,?,?,?,?)", (conv, caso_id, titulo, ts, ts))
+            con.commit()
+        finally:
+            con.close()
+    return conv
+
+
+def listar_conversaciones(caso_id):
+    con = _conn()
+    try:
+        rows = con.execute("SELECT id, titulo, fecha_actualizacion FROM conversaciones "
+                           "WHERE caso_id=? ORDER BY fecha_actualizacion DESC", (caso_id,)).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def conversacion_de_caso(conv_id, caso_id):
+    """True si la conversacion existe y pertenece a ese caso (aislamiento)."""
+    con = _conn()
+    try:
+        r = con.execute("SELECT 1 FROM conversaciones WHERE id=? AND caso_id=?",
+                        (conv_id, caso_id)).fetchone()
+        return r is not None
+    finally:
+        con.close()
+
+
+def leer_mensajes(conv_id):
+    """Mensajes de una conversacion en orden. `meta` se devuelve ya parseado (o None)."""
+    con = _conn()
+    try:
+        rows = con.execute("SELECT rol, texto, meta FROM mensajes WHERE conversacion_id=? "
+                           "ORDER BY fecha_creacion, rowid", (conv_id,)).fetchall()
+    finally:
+        con.close()
+    out = []
+    for r in rows:
+        out.append({"rol": r["rol"], "texto": r["texto"],
+                    "meta": json.loads(r["meta"]) if r["meta"] else None})
+    return out
+
+
+def guardar_intercambio(conv_id, pregunta, respuesta, fuentes_normativas, fuentes_usadas):
+    """Guarda el turno de usuario + el de modelo (con su meta de citas) y toca la
+    fecha_actualizacion de la conversacion."""
+    ts = _ahora()
+    meta = json.dumps({"fuentes_normativas": fuentes_normativas, "fuentes_usadas": fuentes_usadas},
+                      ensure_ascii=False)
+    with _db_lock:
+        con = _conn()
+        try:
+            con.execute("INSERT INTO mensajes (id, conversacion_id, rol, texto, meta, fecha_creacion) "
+                        "VALUES (?,?,?,?,?,?)", (uuid.uuid4().hex[:12], conv_id, "user", pregunta, None, ts))
+            con.execute("INSERT INTO mensajes (id, conversacion_id, rol, texto, meta, fecha_creacion) "
+                        "VALUES (?,?,?,?,?,?)", (uuid.uuid4().hex[:12], conv_id, "model", respuesta, meta, ts))
+            con.execute("UPDATE conversaciones SET fecha_actualizacion=? WHERE id=?", (ts, conv_id))
+            con.commit()
+        finally:
+            con.close()
+
+
+def borrar_conversacion(conv_id):
+    with _db_lock:
+        con = _conn()
+        try:
+            con.execute("DELETE FROM mensajes WHERE conversacion_id=?", (conv_id,))  # explicito + CASCADE
+            con.execute("DELETE FROM conversaciones WHERE id=?", (conv_id,))
+            con.commit()
+        finally:
+            con.close()
 
 
 def borrar_caso(cid):
@@ -502,6 +604,7 @@ class Mensaje(BaseModel):
     historial: list[Turno] = []
     general: bool = False          # True = Consulta General (chat global sin caso, guardrail estricto)
     filtros: Filtros | None = None  # Busqueda hibrida: pre-filtering por metadatos del vector
+    conversacion_id: str = ""      # conversacion persistida (vacio = crear una nueva en el caso)
 
 
 # ============================ HELPERS RAG ============================
@@ -764,6 +867,33 @@ def api_borrar_caso(cid: str):
     return {"ok": True}
 
 
+# ---- Conversaciones (chat persistente dentro de un caso) ----
+@app.get("/api/casos/{cid}/conversaciones")
+def api_listar_conversaciones(cid: str):
+    if not caso_existe(cid):
+        return JSONResponse(status_code=404, content={"error": "Caso no encontrado."})
+    return listar_conversaciones(cid)
+
+
+@app.post("/api/casos/{cid}/conversaciones")
+def api_crear_conversacion(cid: str):
+    if not caso_existe(cid):
+        return JSONResponse(status_code=404, content={"error": "Caso no encontrado."})
+    conv = crear_conversacion(cid)
+    return JSONResponse(status_code=201, content={"id": conv})
+
+
+@app.get("/api/conversaciones/{conv_id}/mensajes")
+def api_leer_mensajes(conv_id: str):
+    return leer_mensajes(conv_id)
+
+
+@app.delete("/api/conversaciones/{conv_id}")
+def api_borrar_conversacion(conv_id: str):
+    borrar_conversacion(conv_id)
+    return {"ok": True}
+
+
 # ---- Fuentes (dentro de un caso) ----
 @app.get("/api/casos/{cid}/fuentes")
 def api_listar_fuentes(cid: str):
@@ -994,12 +1124,24 @@ def chat(m: Mensaje):
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
+    fuentes_norm = _fuentes_normativas(filas)
+    fuentes_usadas = [{"id": f["id"], "nombre": f["nombre"]} for f in activos]
+
+    # PERSISTENCIA: la conversacion vive en SQLite, ligada al caso. Si no llega
+    # conversacion_id (o no pertenece al caso), se crea una nueva con titulo = inicio de la
+    # pregunta. Se guardan el turno de usuario y el de modelo (con su meta de citas).
+    conv_id = m.conversacion_id if conversacion_de_caso(m.conversacion_id, m.caso_id) else ""
+    if not conv_id:
+        conv_id = crear_conversacion(m.caso_id, pregunta or "Análisis de fuentes")
+    guardar_intercambio(conv_id, pregunta, res["respuesta"], fuentes_norm, fuentes_usadas)
+
     return {
         "respuesta": res["respuesta"],
         "modo": m.modo,
-        "fuentes_usadas": [{"id": f["id"], "nombre": f["nombre"]} for f in activos],
-        "fuentes_normativas": _fuentes_normativas(filas),
+        "fuentes_usadas": fuentes_usadas,
+        "fuentes_normativas": fuentes_norm,
         "citas_invalidas": res["citas_invalidas"],
+        "conversacion_id": conv_id,
     }
 
 
@@ -1177,6 +1319,15 @@ HTML = r"""
         </button>
         <p class="text-[11px] text-slate-500">Audita <b>documentos de texto</b> (PDF/Word con OCR automático para escaneos), <b>hojas de cálculo</b> (Excel/CSV → tabla), <b>imágenes de evidencias</b> (PNG/JPG con OCR: series, marcas, notas) y <b>archivos comprimidos</b> (.zip: se desempaqueta y cada archivo entra como fuente independiente).</p>
         <p id="errAdd" class="hidden-x text-xs text-red-300 font-semibold bg-red-500/10 border border-red-500/40 rounded-md px-2 py-1.5"></p>
+      </div>
+
+      <!-- Conversaciones persistentes del caso -->
+      <div class="px-5 py-3 border-b border-slate-800 space-y-2">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-slate-300">Conversaciones</span>
+          <button onclick="nuevaConversacion()" class="text-xs text-blue-400 hover:underline">+ Nueva</button>
+        </div>
+        <div id="listaConversaciones" class="space-y-1 max-h-40 overflow-y-auto text-xs"></div>
       </div>
 
       <div id="lista" class="flex-1 scroll-y px-4 py-3 space-y-2"></div>
@@ -1396,6 +1547,7 @@ let casoActual = null;   // {id, nombre}
 let modoGeneral = false; // true = Consulta General (chat global sin caso, guardrail estricto)
 let fuentes = [];        // fuentes del caso actual
 let historial = [];      // memoria multi-turno del caso/consulta actual
+let conversacionId = ''; // conversacion persistida activa (dentro de un caso); '' = aun sin crear
 const tags = [];
 const MAX_HIST_CLIENTE = 40;
 // Citas (estilo NotebookLM): mapa cid -> fragmento, para abrir el texto al clic.
@@ -1654,10 +1806,12 @@ async function entrarCaso(c){
     // Reengancha el seguimiento global de cualquier fuente aun en proceso (sin duplicar pollers).
     fuentes.forEach(f=>{ if((f.estado||'listo')==='procesando'){ jobAdd(c.id, f.id); pollFuenteGlobal(c.id, f.id); } });
   }catch(e){ document.getElementById('lista').innerHTML = '<p class="text-xs text-red-400">Error al cargar fuentes.</p>'; }
+  // Conversaciones persistentes: lista + carga la mas reciente (si hay).
+  await cargarConversaciones(true);
 }
 // CONSULTA GENERAL: chat global contra el marco normativo, sin caso ni fuentes.
 function entrarConsultaGeneral(){
-  casoActual = null; modoGeneral = true; fuentes = [];
+  casoActual = null; modoGeneral = true; fuentes = []; conversacionId = '';
   mostrarVista('repo');  // se mantiene el repositorio visible a la izquierda
   document.getElementById('casoEnChat').textContent = 'Consulta General — marco normativo (Ley 32069)';
   setChat(true); marcarModoUI();
@@ -1665,7 +1819,7 @@ function entrarConsultaGeneral(){
   resetChatUI('Estás en <b>Consulta General</b> (modo estricto 🔒). Pregunta sobre el marco normativo cargado (Ley 32069 y su Reglamento). El asistente responde <b>solo</b> desde la normativa recuperada; si la respuesta no está, lo dirá explícitamente.');
 }
 function volverCasos(){
-  casoActual = null; modoGeneral = false; fuentes = []; historial = [];
+  casoActual = null; modoGeneral = false; fuentes = []; historial = []; conversacionId = '';
   mostrarVista('repo');   // vuelve a vista-repositorio, oculta vista-detalle-caso
   setChat(false); marcarModoUI();
   document.getElementById('casoEnChat').textContent = '— (ninguno)';
@@ -2063,37 +2217,116 @@ async function enviar(){
       body: JSON.stringify({caso_id: casoActual ? casoActual.id : '', general: modoGeneral,
                             pregunta: texto, fuentes_activas: activas, modo: 'chat', k: 5,
                             historial: historial.slice(-MAX_HIST_CLIENTE),
+                            conversacion_id: conversacionId,
                             filtros: leerFiltros()})}, 180000);
     let d = {}; try { d = await r.json(); } catch(_){ d = {}; }
     if(!r.ok){ cargando.innerHTML = '<span class="text-amber-700">Error '+r.status+': '+esc(d.error||'fallo del servidor')+'</span>'; return; }
     if(d.error){ cargando.innerHTML = '<span class="text-amber-700">'+esc(d.error)+'</span>'; return; }
-    _msgSeq++;
-    const _frags = d.fuentes_normativas || [];
-    let h = esc(d.respuesta || 'Sin respuesta.');
-    // Marcadores [N] -> badge cobre clicable (split/join: sin regex ni escapes).
-    _frags.forEach(fr => {
-      if(fr.numero == null) return;
-      const cid = _msgSeq + '_' + fr.numero; _citas[cid] = fr;
-      const badge = '<button type="button" class="cita-badge" data-cid="'+cid+'" title="Ver fuente">'+fr.numero+'</button>';
-      h = h.split('['+fr.numero+']').join(badge);
-    });
-    if(d.fuentes_usadas && d.fuentes_usadas.length){
-      h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes del caso usadas:</b> '
-         + d.fuentes_usadas.map(x=>esc(x.nombre)).join(', ') + '</div>';
-    }
-    if(_frags.length){
-      h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes citadas:</b><br>'
-         + _frags.map(s=>'<button type="button" data-cid="'+(_msgSeq+'_'+s.numero)+'" class="inline-flex items-center gap-1 bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1 hover:border-blue-500 transition"><span class="cita-badge">'+s.numero+'</span>'+esc(s.cita || s.documento)+'</button>').join('') + '</div>';
-    }
-    cargando.innerHTML = h;
+    cargando.innerHTML = pintarRespuestaBot(d.respuesta, d.fuentes_normativas, d.fuentes_usadas);
     if(userTxt) historial.push({rol:'user', texto:userTxt});
     historial.push({rol:'model', texto: d.respuesta || ''});
     if(historial.length > MAX_HIST_CLIENTE) historial = historial.slice(-MAX_HIST_CLIENTE);
+    // Persistencia: si el backend creo/uso una conversacion, sincroniza el id y refresca la lista.
+    if(d.conversacion_id && d.conversacion_id !== conversacionId){
+      conversacionId = d.conversacion_id;
+      if(casoActual) cargarConversaciones(false);
+    }
   }catch(e){
     if(e && e.name==='AbortError'){ cargando.innerHTML = '<span class="text-amber-700">La consulta tardó demasiado y se canceló (timeout).</span>'; }
     else { cargando.innerHTML = '<span class="text-amber-700">Error: '+esc(String(e))+'</span>'; }
   }
   finally{ document.getElementById('btnChat').disabled=false; chat.scrollTop=chat.scrollHeight; }
+}
+
+// =================== CONVERSACIONES (chat persistente por caso) ===================
+// Re-pinta una respuesta del modelo (badges [N] + "Fuentes citadas") con la MISMA logica
+// que usa enviar(): sirve para respuestas nuevas Y para re-pintar una conversacion guardada.
+function pintarRespuestaBot(respuesta, fragmentos, fuentesUsadas){
+  _msgSeq++;
+  const _frags = fragmentos || [];
+  let h = esc(respuesta || 'Sin respuesta.');
+  _frags.forEach(fr => {
+    if(fr.numero == null) return;
+    const cid = _msgSeq + '_' + fr.numero; _citas[cid] = fr;
+    const badge = '<button type="button" class="cita-badge" data-cid="'+cid+'" title="Ver fuente">'+fr.numero+'</button>';
+    h = h.split('['+fr.numero+']').join(badge);
+  });
+  if(fuentesUsadas && fuentesUsadas.length){
+    h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes del caso usadas:</b> '
+       + fuentesUsadas.map(x=>esc(x.nombre)).join(', ') + '</div>';
+  }
+  if(_frags.length){
+    h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes citadas:</b><br>'
+       + _frags.map(s=>'<button type="button" data-cid="'+(_msgSeq+'_'+s.numero)+'" class="inline-flex items-center gap-1 bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1 hover:border-blue-500 transition"><span class="cita-badge">'+s.numero+'</span>'+esc(s.cita || s.documento)+'</button>').join('') + '</div>';
+  }
+  return h;
+}
+
+// Lista las conversaciones del caso; si `cargarUltima`, abre la mas reciente (o deja limpio).
+async function cargarConversaciones(cargarUltima){
+  if(!casoActual) return;
+  let convs = [];
+  try{ convs = await (await fetch('/api/casos/'+casoActual.id+'/conversaciones')).json(); }catch(e){}
+  if(!Array.isArray(convs)) convs = [];
+  const cont = document.getElementById('listaConversaciones');
+  if(cont){
+    cont.innerHTML = convs.length ? '' : '<p class="text-slate-500 text-[10px]">Sin conversaciones aún.</p>';
+    convs.forEach(cv => {
+      const row = document.createElement('div');
+      row.className = 'flex items-center gap-1 rounded px-2 py-1 hover:bg-slate-800 cursor-pointer'
+                    + (cv.id===conversacionId ? ' bg-slate-800 ring-1 ring-blue-500/40' : '');
+      const t = document.createElement('span');
+      t.className = 'truncate flex-1 text-slate-200'; t.title = cv.titulo || '(sin título)';
+      t.textContent = cv.titulo || '(sin título)';
+      t.onclick = ()=>abrirConversacion(cv.id);
+      const x = document.createElement('button');
+      x.className = 'text-slate-500 hover:text-red-400 flex-none'; x.textContent = '✕'; x.title = 'Borrar conversación';
+      x.onclick = (e)=>{ e.stopPropagation(); borrarConversacion(cv.id); };
+      row.append(t, x); cont.appendChild(row);
+    });
+  }
+  if(cargarUltima){
+    if(convs.length){ await abrirConversacion(convs[0].id); }
+    else { conversacionId=''; historial=[]; }
+  }
+}
+
+// Abre una conversacion: carga sus mensajes, los re-pinta y rehidrata `historial`.
+async function abrirConversacion(convId){
+  let msgs = [];
+  try{ msgs = await (await fetch('/api/conversaciones/'+convId+'/mensajes')).json(); }catch(e){}
+  if(!Array.isArray(msgs)) msgs = [];
+  conversacionId = convId;
+  historial = msgs.map(m=>({rol:m.rol, texto:m.texto||''}));
+  chat.innerHTML = '';
+  if(!msgs.length){ resetChatUI('Conversación vacía. Escribe tu consulta.'); }
+  msgs.forEach(m=>{
+    if(m.rol==='user'){ addMsg(m.texto ? esc(m.texto) : '<i>Analizar las fuentes activas</i>', 'user'); }
+    else { const meta = m.meta || {}; addMsg(pintarRespuestaBot(m.texto, meta.fuentes_normativas, meta.fuentes_usadas), 'bot'); }
+  });
+  chat.scrollTop = chat.scrollHeight;
+  cargarConversaciones(false);   // refresca el resaltado de la activa
+}
+
+// Crea una conversacion vacia, limpia el chat y apunta a ella.
+async function nuevaConversacion(){
+  if(!casoActual) return;
+  try{
+    const d = await (await fetch('/api/casos/'+casoActual.id+'/conversaciones', {method:'POST'})).json();
+    conversacionId = d.id || '';
+  }catch(e){ conversacionId=''; }
+  historial = [];
+  resetChatUI('Nueva conversación en <b>'+esc(casoActual.nombre)+'</b>. Escribe tu consulta.');
+  cargarConversaciones(false);
+}
+
+async function borrarConversacion(convId){
+  try{ await fetch('/api/conversaciones/'+convId, {method:'DELETE'}); }catch(e){}
+  if(convId===conversacionId){
+    conversacionId=''; historial=[];
+    resetChatUI('Conversación borrada. Inicia una nueva o selecciona otra.');
+  }
+  cargarConversaciones(false);
 }
 
 // =================== INIT ===================

@@ -40,4 +40,4 @@
 
 # Tests
 !tests/
-!tests/test_prompt_golden.py
+!tests/*.py

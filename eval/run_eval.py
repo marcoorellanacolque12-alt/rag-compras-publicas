@@ -46,22 +46,32 @@ def _declino(texto):
     return FRASE_DECLINA in (texto or "").lower()
 
 
+# Filtros por DEFECTO de produccion (resoluciones del TCP apagadas salvo opt-in).
+FILTROS_DEFAULT = {"categorias": [], "excluir_derogada": True, "anio": "Todos",
+                   "normas": None, "incluir_resoluciones": False}
+
+
 def _ref_encontrada(filas, esperada):
-    """True si alguna fila satisface la ref esperada: doc_label contiene el `doc` Y la
-    `referencia` coincide con el campo referencia o articulo_num de la fila."""
+    """True si alguna fila satisface la ref esperada: doc_label contiene el `doc`; si la
+    `referencia` esperada esta presente, ademas debe coincidir (referencia o articulo_num).
+    Sin `referencia` -> match a nivel DOCUMENTO (recall de que la norma aparezca)."""
     doc_e = (esperada.get("doc") or "").lower()
     ref_e = str(esperada.get("referencia") or "").strip()
     for f in filas:
         etiqueta = (doc_label(f.get("documento"), f.get("chunk_id")) or "").lower()
-        refs_fila = {str(f.get("referencia") or ""), str(f.get("articulo_num") or "")}
-        if doc_e in etiqueta and ref_e in refs_fila:
+        if doc_e and doc_e not in etiqueta:
+            continue
+        if not ref_e:
+            return True                       # recall a nivel documento
+        if ref_e in {str(f.get("referencia") or ""), str(f.get("articulo_num") or "")}:
             return True
     return False
 
 
 # ---------------------------- evaluadores por tipo ----------------------------
 def ev_recall(caso, k, temp, juez):
-    filas = recuperar(consultas_busqueda(caso["pregunta"]), k=k)
+    # Mide con los filtros por defecto de produccion (resoluciones apagadas).
+    filas = recuperar(consultas_busqueda(caso["pregunta"]), k=k, filtros=FILTROS_DEFAULT)
     esperadas = caso.get("refs_esperadas", [])
     hits = [e for e in esperadas if _ref_encontrada(filas, e)]
     recall = len(hits) / len(esperadas) if esperadas else 0.0
@@ -72,7 +82,7 @@ def ev_recall(caso, k, temp, juez):
 
 def ev_fidelidad(caso, k, temp, juez):
     # MISMA ruta que produccion: recupera en modo general y genera con generar_respuesta.
-    filas = recuperar(consultas_busqueda(caso["pregunta"]), k=k)
+    filas = recuperar(consultas_busqueda(caso["pregunta"]), k=k, filtros=FILTROS_DEFAULT)
     r = generar_respuesta(caso["pregunta"], filas, modo="general", temperatura=temp)
     ok = not r["citas_invalidas"]   # citas calculadas sobre la salida CRUDA del modelo
     res = {"ok": ok, "citas_validas": r["citas_validas"],
@@ -83,7 +93,7 @@ def ev_fidelidad(caso, k, temp, juez):
 
 
 def ev_frontera(caso, k, temp, juez):
-    filas = recuperar(consultas_busqueda(caso["pregunta"]), k=k)
+    filas = recuperar(consultas_busqueda(caso["pregunta"]), k=k, filtros=FILTROS_DEFAULT)
     r = generar_respuesta(caso["pregunta"], filas, modo="general", temperatura=temp)
     declino = _declino(r["respuesta"])
     esperado = caso.get("esperado")

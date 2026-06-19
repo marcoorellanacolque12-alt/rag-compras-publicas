@@ -259,6 +259,13 @@ def _construir_prefiltro(filtros):
         conds.append("categoria IN UNNEST(@f_cats)")
         params.append(bigquery.ArrayQueryParameter("f_cats", "STRING", cats))
 
+    # RESOLUCIONES DEL TRIBUNAL: apagadas por defecto (las ~9.940 ahogaban a las normas
+    # primarias). Solo entran si el usuario las activa explicitamente (incluir_resoluciones).
+    # NO afecta a Ley/Reglamento/Directivas/Opiniones/Orientacion, que son transversales y
+    # siempre elegibles (la `fase` por articulo NO es filtro: nunca descarta un articulo).
+    if not filtros.get("incluir_resoluciones"):
+        conds.append("IFNULL(categoria, '') != 'resoluciones_tribunal'")
+
     if filtros.get("excluir_derogada"):
         conds.append("IFNULL(vigente, TRUE) = TRUE")
 
@@ -314,8 +321,26 @@ def listar_normas():
     return out
 
 
-_COLS_CHUNK = ("chunk_id", "documento", "tipo_referencia", "referencia", "fase", "emisor",
-               "articulo_num", "articulo_titulo", "parte", "texto")
+_COLS_CHUNK = ("chunk_id", "categoria", "documento", "tipo_referencia", "referencia", "fase",
+               "emisor", "articulo_num", "articulo_titulo", "parte", "texto")
+
+# ===== JERARQUIA DE AUTORIDAD (un solo lugar) =====
+# Orden mayor -> menor autoridad. Se traduce en una penalidad ADITIVA sobre la distancia
+# coseno: una norma de mayor autoridad NO es desplazada por una de menor autoridad con
+# similitud parecida. El Reglamento (leyes_y_reglamentos) flota por encima de resoluciones
+# igual de "parecidas".
+ORDEN_AUTORIDAD = ("leyes_y_reglamentos", "directivas", "opiniones",
+                   "resoluciones_tribunal", "documentos_orientacion")
+PESO_AUTORIDAD = {cat: round(0.05 * i, 3) for i, cat in enumerate(ORDEN_AUTORIDAD)}
+PESO_AUTORIDAD_DEFAULT = 0.10      # categoria desconocida/None
+
+
+def _score_autoridad(fila):
+    """Score de ranking: distancia coseno + penalidad por (baja) autoridad de categoria.
+    Menor = mejor."""
+    dist = fila.get("distance")
+    dist = 1.0 if dist is None else dist
+    return dist + PESO_AUTORIDAD.get(fila.get("categoria"), PESO_AUTORIDAD_DEFAULT)
 
 
 def _buscar(consulta, k, filtros=None):
@@ -328,7 +353,7 @@ def _buscar(consulta, k, filtros=None):
     where, fparams = _construir_prefiltro(filtros)
     relacion = f"(SELECT * FROM {tabla} WHERE {where})" if where else f"TABLE {tabla}"
     sql = f"""
-    SELECT base.chunk_id AS chunk_id, base.documento AS documento,
+    SELECT base.chunk_id AS chunk_id, base.categoria AS categoria, base.documento AS documento,
            base.tipo_referencia AS tipo_referencia, base.referencia AS referencia,
            base.fase AS fase, base.emisor AS emisor,
            base.articulo_num AS articulo_num, base.articulo_titulo AS articulo_titulo,
@@ -406,7 +431,8 @@ def recuperar(consulta, k=TOP_K, filtros=None, completar=COMPLETAR_ARTICULO):
             cid = f["chunk_id"]
             if cid not in fusion or f["distance"] < fusion[cid]["distance"]:
                 fusion[cid] = f
-    filas = sorted(fusion.values(), key=lambda r: r["distance"])[:k]
+    # Ranking por AUTORIDAD: distancia + penalidad de categoria (jerarquia de normas).
+    filas = sorted(fusion.values(), key=_score_autoridad)[:k]
     return _completar_articulos(filas) if completar else filas
 
 

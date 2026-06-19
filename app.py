@@ -632,6 +632,7 @@ class Filtros(BaseModel):
     excluir_derogada: bool = True       # solo normativa vigente
     anio: str = "Todos"                 # Todos | 2026 | 2025 | 2024 | Anteriores
     normas: list[str] | None = None     # doc_ids seleccionados (None = todas; [] = ninguna)
+    incluir_resoluciones: bool = False  # opt-in: incluir resoluciones del TCP (apagadas por defecto)
 
 
 class Mensaje(BaseModel):
@@ -1547,12 +1548,11 @@ HTML = r"""
               <optgroup label="Herramientas y formatos estándar" class="bg-slate-900 text-slate-300">
                 <option value="documentos_orientacion">Documentos de orientación / formatos</option>
               </optgroup>
-              <optgroup label="Jurisprudencia y criterios vinculantes" class="bg-slate-900 text-slate-300">
-                <option value="resoluciones_tribunal">Resoluciones del tribunal</option>
+              <optgroup label="Criterios vinculantes" class="bg-slate-900 text-slate-300">
                 <option value="opiniones">Opiniones</option>
               </optgroup>
             </select>
-            <span class="text-[10px] text-slate-500">Sin selección = busca en todas las categorías.</span>
+            <span class="text-[10px] text-slate-500">Sin selección = todas (las resoluciones del Tribunal se controlan abajo).</span>
           </div>
           <div class="flex flex-col gap-1">
             <label class="text-xs font-medium text-slate-300">Año de emisión</label>
@@ -1568,6 +1568,10 @@ HTML = r"""
           <label class="flex items-center gap-2 text-xs text-slate-300">
             <input type="checkbox" id="filtroVigente" checked class="w-4 h-4 accent-blue-500">
             Excluir normativa derogada
+          </label>
+          <label class="flex items-center gap-2 text-xs text-slate-300">
+            <input type="checkbox" id="filtroResoluciones" class="w-4 h-4 accent-blue-500">
+            Incluir resoluciones del Tribunal <span class="text-slate-500">(jurisprudencia; ~9.9k)</span>
           </label>
         </div>
 
@@ -2262,6 +2266,7 @@ function leerFiltros(){
     excluir_derogada: document.getElementById('filtroVigente').checked,
     anio: document.getElementById('filtroAnio').value,
     normas: normas,
+    incluir_resoluciones: document.getElementById('filtroResoluciones').checked,
   };
 }
 async function enviar(){

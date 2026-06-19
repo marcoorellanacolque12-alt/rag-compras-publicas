@@ -178,10 +178,11 @@ def _init_db():
                 fecha_creacion TEXT NOT NULL
             )""")
         # Conversaciones persistentes (solo dentro de un caso). Se borran en cascada con el caso.
+        # caso_id NULL = Consulta General (sin caso). El FK CASCADE aplica cuando SI hay caso.
         con.execute("""
             CREATE TABLE IF NOT EXISTS conversaciones (
                 id                  TEXT PRIMARY KEY,
-                caso_id             TEXT NOT NULL,
+                caso_id             TEXT,                  -- NULL = Consulta General
                 titulo              TEXT,
                 fecha_creacion      TEXT NOT NULL,
                 fecha_actualizacion TEXT NOT NULL,
@@ -198,6 +199,30 @@ def _init_db():
                 FOREIGN KEY (conversacion_id) REFERENCES conversaciones(id) ON DELETE CASCADE
             )""")
         con.commit()
+
+        # MIGRACION SEGURA: si una BD previa creo conversaciones.caso_id como NOT NULL,
+        # reconstruir la tabla como NULLABLE preservando todas las filas (para Consultas
+        # Generales con caso_id NULL). Idempotente: solo corre si detecta el NOT NULL.
+        info = con.execute("PRAGMA table_info(conversaciones)").fetchall()
+        col = next((c for c in info if c["name"] == "caso_id"), None)
+        if col is not None and col["notnull"] == 1:
+            con.execute("PRAGMA foreign_keys = OFF")
+            con.execute("""
+                CREATE TABLE conversaciones_mig (
+                    id                  TEXT PRIMARY KEY,
+                    caso_id             TEXT,
+                    titulo              TEXT,
+                    fecha_creacion      TEXT NOT NULL,
+                    fecha_actualizacion TEXT NOT NULL,
+                    FOREIGN KEY (caso_id) REFERENCES casos(id) ON DELETE CASCADE
+                )""")
+            con.execute("INSERT INTO conversaciones_mig SELECT id, caso_id, titulo, "
+                        "fecha_creacion, fecha_actualizacion FROM conversaciones")
+            con.execute("DROP TABLE conversaciones")
+            con.execute("ALTER TABLE conversaciones_mig RENAME TO conversaciones")
+            con.commit()
+            con.execute("PRAGMA foreign_keys = ON")
+            print("[migracion] conversaciones.caso_id ahora es NULLABLE (Consulta General).")
     finally:
         con.close()
 
@@ -255,21 +280,35 @@ def crear_conversacion(caso_id, titulo=""):
 
 
 def listar_conversaciones(caso_id):
+    """Conversaciones de un caso, o las de Consulta General si caso_id es None/'' (caso_id NULL)."""
+    general = caso_id is None or caso_id == ""
     con = _conn()
     try:
-        rows = con.execute("SELECT id, titulo, fecha_actualizacion FROM conversaciones "
-                           "WHERE caso_id=? ORDER BY fecha_actualizacion DESC", (caso_id,)).fetchall()
+        if general:
+            rows = con.execute("SELECT id, titulo, fecha_actualizacion FROM conversaciones "
+                               "WHERE caso_id IS NULL ORDER BY fecha_actualizacion DESC").fetchall()
+        else:
+            rows = con.execute("SELECT id, titulo, fecha_actualizacion FROM conversaciones "
+                               "WHERE caso_id=? ORDER BY fecha_actualizacion DESC", (caso_id,)).fetchall()
     finally:
         con.close()
     return [dict(r) for r in rows]
 
 
 def conversacion_de_caso(conv_id, caso_id):
-    """True si la conversacion existe y pertenece a ese caso (aislamiento)."""
+    """True si la conversacion existe y pertenece a ese ambito: un caso concreto, o la
+    Consulta General (caso_id None/'' -> caso_id NULL). Da aislamiento entre ambitos."""
+    if not conv_id:
+        return False
+    general = caso_id is None or caso_id == ""
     con = _conn()
     try:
-        r = con.execute("SELECT 1 FROM conversaciones WHERE id=? AND caso_id=?",
-                        (conv_id, caso_id)).fetchone()
+        if general:
+            r = con.execute("SELECT 1 FROM conversaciones WHERE id=? AND caso_id IS NULL",
+                            (conv_id,)).fetchone()
+        else:
+            r = con.execute("SELECT 1 FROM conversaciones WHERE id=? AND caso_id=?",
+                            (conv_id, caso_id)).fetchone()
         return r is not None
     finally:
         con.close()
@@ -883,6 +922,16 @@ def api_crear_conversacion(cid: str):
     return JSONResponse(status_code=201, content={"id": conv})
 
 
+@app.get("/api/conversaciones_generales")
+def api_listar_conversaciones_generales():
+    return listar_conversaciones(None)   # caso_id NULL = Consulta General
+
+
+@app.post("/api/conversaciones_generales")
+def api_crear_conversacion_general():
+    return JSONResponse(status_code=201, content={"id": crear_conversacion(None)})
+
+
 @app.get("/api/conversaciones/{conv_id}/mensajes")
 def api_leer_mensajes(conv_id: str):
     return leer_mensajes(conv_id)
@@ -1081,12 +1130,21 @@ def chat(m: Mensaje):
             res = generar_respuesta(pregunta, filas, modo="general", historial=m.historial)
         except Exception as e:
             return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
+
+        fuentes_norm = _fuentes_normativas(filas)
+        # PERSISTENCIA (Consulta General = conversacion con caso_id NULL). Misma maquinaria
+        # que los casos: crea/usa la conversacion general y guarda ambos turnos.
+        conv_id = m.conversacion_id if conversacion_de_caso(m.conversacion_id, None) else ""
+        if not conv_id:
+            conv_id = crear_conversacion(None, pregunta)
+        guardar_intercambio(conv_id, pregunta, res["respuesta"], fuentes_norm, [])
         return {
             "respuesta": res["respuesta"],
             "modo": "general",
             "fuentes_usadas": [],
-            "fuentes_normativas": _fuentes_normativas(filas),
+            "fuentes_normativas": fuentes_norm,
             "citas_invalidas": res["citas_invalidas"],
+            "conversacion_id": conv_id,
         }
 
     # ===== CHAT / ANALISIS dentro de un caso =====
@@ -1262,6 +1320,15 @@ HTML = r"""
         <p class="text-[11px] text-slate-500 mt-1.5 flex items-center gap-1">
           <span>🔒</span> Modo estricto: responde solo desde el marco normativo cargado (cero alucinaciones).
         </p>
+      </div>
+
+      <!-- Conversaciones de Consulta General (mismo componente que en los casos). Solo en modo General. -->
+      <div id="convGeneralBox" class="px-5 py-3 border-b border-slate-800 space-y-2" style="display:none">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-slate-300">Consultas recientes</span>
+          <button onclick="nuevaConversacion()" class="text-xs text-blue-400 hover:underline">+ Nueva</button>
+        </div>
+        <div id="listaConversacionesGeneral" class="space-y-1 max-h-40 overflow-y-auto text-xs"></div>
       </div>
 
       <div class="px-5 py-4 border-b border-slate-800">
@@ -1778,6 +1845,8 @@ function marcarModoUI(){
   // y dentro de un caso) para acotar la busqueda vectorial. display inline = sin choque de cascade.
   const fb = document.getElementById('filtrosBar');
   if(fb) fb.style.display = 'flex';
+  const cg = document.getElementById('convGeneralBox');   // "Consultas recientes" solo en General
+  if(cg) cg.style.display = modoGeneral ? 'block' : 'none';
   if(modoGeneral){
     badge.classList.remove('hidden-x'); badge.classList.add('inline-flex');
     btnG.classList.add('ring-2','ring-emerald-300');
@@ -1817,6 +1886,7 @@ function entrarConsultaGeneral(){
   setChat(true); marcarModoUI();
   cargarNormas();   // pobla el menu de seleccion individual de normas
   resetChatUI('Estás en <b>Consulta General</b> (modo estricto 🔒). Pregunta sobre el marco normativo cargado (Ley 32069 y su Reglamento). El asistente responde <b>solo</b> desde la normativa recuperada; si la respuesta no está, lo dirá explícitamente.');
+  cargarConversaciones(true);   // lista las consultas recientes y autoabre la mas reciente
 }
 function volverCasos(){
   casoActual = null; modoGeneral = false; fuentes = []; historial = []; conversacionId = '';
@@ -2229,7 +2299,7 @@ async function enviar(){
     // Persistencia: si el backend creo/uso una conversacion, sincroniza el id y refresca la lista.
     if(d.conversacion_id && d.conversacion_id !== conversacionId){
       conversacionId = d.conversacion_id;
-      if(casoActual) cargarConversaciones(false);
+      if(casoActual || modoGeneral) cargarConversaciones(false);
     }
   }catch(e){
     if(e && e.name==='AbortError'){ cargando.innerHTML = '<span class="text-amber-700">La consulta tardó demasiado y se canceló (timeout).</span>'; }
@@ -2263,12 +2333,20 @@ function pintarRespuestaBot(respuesta, fragmentos, fuentesUsadas){
 }
 
 // Lista las conversaciones del caso; si `cargarUltima`, abre la mas reciente (o deja limpio).
+// Contexto de conversaciones segun el modo: caso (listaConversaciones) o General
+// (listaConversacionesGeneral). null si no aplica (vista de repositorio sin General).
+function _convCtx(){
+  if(modoGeneral) return {lista:'listaConversacionesGeneral', base:'/api/conversaciones_generales'};
+  if(casoActual)  return {lista:'listaConversaciones', base:'/api/casos/'+casoActual.id+'/conversaciones'};
+  return null;
+}
 async function cargarConversaciones(cargarUltima){
-  if(!casoActual) return;
+  const ctx = _convCtx();
+  if(!ctx) return;
   let convs = [];
-  try{ convs = await (await fetch('/api/casos/'+casoActual.id+'/conversaciones')).json(); }catch(e){}
+  try{ convs = await (await fetch(ctx.base)).json(); }catch(e){}
   if(!Array.isArray(convs)) convs = [];
-  const cont = document.getElementById('listaConversaciones');
+  const cont = document.getElementById(ctx.lista);
   if(cont){
     cont.innerHTML = convs.length ? '' : '<p class="text-slate-500 text-[10px]">Sin conversaciones aún.</p>';
     convs.forEach(cv => {
@@ -2308,15 +2386,17 @@ async function abrirConversacion(convId){
   cargarConversaciones(false);   // refresca el resaltado de la activa
 }
 
-// Crea una conversacion vacia, limpia el chat y apunta a ella.
+// Crea una conversacion vacia (caso o General), limpia el chat y apunta a ella.
 async function nuevaConversacion(){
-  if(!casoActual) return;
+  const ctx = _convCtx();
+  if(!ctx) return;
   try{
-    const d = await (await fetch('/api/casos/'+casoActual.id+'/conversaciones', {method:'POST'})).json();
+    const d = await (await fetch(ctx.base, {method:'POST'})).json();
     conversacionId = d.id || '';
   }catch(e){ conversacionId=''; }
   historial = [];
-  resetChatUI('Nueva conversación en <b>'+esc(casoActual.nombre)+'</b>. Escribe tu consulta.');
+  resetChatUI(modoGeneral ? 'Nueva consulta general. Escribe tu pregunta sobre el marco normativo.'
+                          : 'Nueva conversación en <b>'+esc(casoActual.nombre)+'</b>. Escribe tu consulta.');
   cargarConversaciones(false);
 }
 

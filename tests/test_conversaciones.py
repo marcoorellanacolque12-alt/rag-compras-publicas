@@ -74,6 +74,85 @@ class TestConversaciones(unittest.TestCase):
         self.assertEqual(app.listar_conversaciones(cid), [])
         self.assertEqual(app.leer_mensajes(conv), [])
 
+    def test_general_roundtrip_y_aislamiento(self):
+        """Conversacion de Consulta General (caso_id NULL): crear, listar, leer; aislada
+        de las conversaciones de los casos."""
+        caso = app.crear_caso("Caso X")
+        cgen = app.crear_conversacion(None, "¿Que es el SEACE?")          # general
+        ccaso = app.crear_conversacion(caso["id"], "Pregunta del caso")    # de caso
+        app.guardar_intercambio(cgen, "¿que es?", "respuesta general", [{"numero": 1}], [])
+
+        generales = app.listar_conversaciones(None)
+        ids_gen = [c["id"] for c in generales]
+        self.assertIn(cgen, ids_gen)
+        self.assertNotIn(ccaso, ids_gen)                 # la de caso NO aparece en generales
+        self.assertNotIn(cgen, [c["id"] for c in app.listar_conversaciones(caso["id"])])
+
+        self.assertEqual([m["rol"] for m in app.leer_mensajes(cgen)], ["user", "model"])
+        # pertenencia por ambito
+        self.assertTrue(app.conversacion_de_caso(cgen, None))
+        self.assertFalse(app.conversacion_de_caso(cgen, caso["id"]))
+        self.assertTrue(app.conversacion_de_caso(ccaso, caso["id"]))
+        self.assertFalse(app.conversacion_de_caso(ccaso, None))
+
+    def test_hilo_reutiliza_no_forka(self):
+        """La decision de backend (conversacion_de_caso) hace que un seguimiento se AGREGUE
+        a la misma conversacion en vez de crear otra."""
+        caso = app.crear_caso("Hilo")
+        cid = caso["id"]
+        conv = app.crear_conversacion(cid, "primera")
+        # dos turnos en la MISMA conversacion (como hace /api/chat al recibir el conversacion_id)
+        app.guardar_intercambio(conv, "p1", "r1", [], [])
+        self.assertTrue(app.conversacion_de_caso(conv, cid))   # -> chat reutiliza, no crea
+        app.guardar_intercambio(conv, "p2", "r2", [], [])
+        self.assertEqual(len(app.leer_mensajes(conv)), 4)      # 2 turnos = 4 mensajes
+        self.assertEqual(len(app.listar_conversaciones(cid)), 1)  # UNA sola conversacion
+
+
+class TestMigracionCasoIdNullable(unittest.TestCase):
+    """La migracion convierte conversaciones.caso_id NOT NULL -> NULLABLE preservando datos."""
+
+    def setUp(self):
+        fd, self.tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._orig = app.DB_PATH
+        app.DB_PATH = self.tmp
+
+    def tearDown(self):
+        app.DB_PATH = self._orig
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.tmp + suf)
+            except OSError:
+                pass
+
+    def test_migracion_preserva_filas(self):
+        # BD "vieja": conversaciones.caso_id NOT NULL, con una fila.
+        con = app._conn()
+        con.execute("CREATE TABLE casos (id TEXT PRIMARY KEY, nombre TEXT NOT NULL, fecha_creacion TEXT NOT NULL)")
+        con.execute("""CREATE TABLE conversaciones (
+            id TEXT PRIMARY KEY, caso_id TEXT NOT NULL, titulo TEXT,
+            fecha_creacion TEXT NOT NULL, fecha_actualizacion TEXT NOT NULL,
+            FOREIGN KEY (caso_id) REFERENCES casos(id) ON DELETE CASCADE)""")
+        con.execute("INSERT INTO casos VALUES ('c1','Caso','t')")
+        con.execute("INSERT INTO conversaciones VALUES ('v1','c1','tit','t','t')")
+        con.commit(); con.close()
+
+        app._init_db()   # detecta NOT NULL y reconstruye como NULLABLE
+
+        con = app._conn()
+        try:
+            col = next(c for c in con.execute("PRAGMA table_info(conversaciones)").fetchall()
+                       if c["name"] == "caso_id")
+            self.assertEqual(col["notnull"], 0)   # ahora NULLABLE
+            self.assertIsNotNone(con.execute("SELECT 1 FROM conversaciones WHERE id='v1'").fetchone())
+            # ahora SI se puede insertar una conversacion General (caso_id NULL)
+            con.execute("INSERT INTO conversaciones VALUES ('g1',NULL,'gen','t','t')")
+            con.commit()
+            self.assertIsNotNone(con.execute("SELECT 1 FROM conversaciones WHERE id='g1' AND caso_id IS NULL").fetchone())
+        finally:
+            con.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -259,11 +259,21 @@ def _construir_prefiltro(filtros):
         conds.append("categoria IN UNNEST(@f_cats)")
         params.append(bigquery.ArrayQueryParameter("f_cats", "STRING", cats))
 
-    # RESOLUCIONES DEL TRIBUNAL: apagadas por defecto (las ~9.940 ahogaban a las normas
-    # primarias). Solo entran si el usuario las activa explicitamente (incluir_resoluciones).
-    # NO afecta a Ley/Reglamento/Directivas/Opiniones/Orientacion, que son transversales y
-    # siempre elegibles (la `fase` por articulo NO es filtro: nunca descarta un articulo).
-    if not filtros.get("incluir_resoluciones"):
+    # RESOLUCIONES DEL TRIBUNAL: control FINO por subtipo (toggles independientes). Solo
+    # entran los subtipos activados; 'otra' nunca (por ahora, sin control propio). Ambos OFF
+    # = ninguna resolucion (igual que antes). NO afecta a las demas categorias (transversales,
+    # siempre elegibles). El PESO por jerarquia (ranking) es aparte: decide cuanto pesan, no
+    # cuales entran.
+    subtipos_ok = []
+    if filtros.get("incluir_apelacion"):
+        subtipos_ok.append("apelacion")
+    if filtros.get("incluir_sancionadoras"):
+        subtipos_ok.append("sancionadora")
+    if subtipos_ok:
+        conds.append("(IFNULL(categoria, '') != 'resoluciones_tribunal' "
+                     "OR subtipo IN UNNEST(@f_subtipos))")
+        params.append(bigquery.ArrayQueryParameter("f_subtipos", "STRING", subtipos_ok))
+    else:
         conds.append("IFNULL(categoria, '') != 'resoluciones_tribunal'")
 
     if filtros.get("excluir_derogada"):

@@ -632,7 +632,9 @@ class Filtros(BaseModel):
     excluir_derogada: bool = True       # solo normativa vigente
     anio: str = "Todos"                 # Todos | 2026 | 2025 | 2024 | Anteriores
     normas: list[str] | None = None     # doc_ids seleccionados (None = todas; [] = ninguna)
-    incluir_resoluciones: bool = False  # opt-in: incluir resoluciones del TCP (apagadas por defecto)
+    # Resoluciones del TCP por SUBTIPO (toggles independientes; ambos OFF = ninguna).
+    incluir_apelacion: bool = False       # resoluciones de apelacion
+    incluir_sancionadoras: bool = False   # resoluciones sancionadoras ('otra' no tiene toggle)
 
 
 class Mensaje(BaseModel):
@@ -1569,10 +1571,17 @@ HTML = r"""
             <input type="checkbox" id="filtroVigente" checked class="w-4 h-4 accent-blue-500">
             Excluir normativa derogada
           </label>
-          <label class="flex items-center gap-2 text-xs text-slate-300">
-            <input type="checkbox" id="filtroResoluciones" class="w-4 h-4 accent-blue-500">
-            Incluir resoluciones del Tribunal <span class="text-slate-500">(jurisprudencia; ~9.9k)</span>
-          </label>
+          <div class="flex flex-col gap-1.5 border-t border-slate-800/70 pt-2">
+            <span class="text-[11px] text-slate-500">Resoluciones del Tribunal (jurisprudencia, por subtipo):</span>
+            <label class="flex items-center gap-2 text-xs text-slate-300">
+              <input type="checkbox" id="filtroApelacion" class="w-4 h-4 accent-blue-500">
+              Resoluciones de apelación
+            </label>
+            <label class="flex items-center gap-2 text-xs text-slate-300">
+              <input type="checkbox" id="filtroSancionadoras" class="w-4 h-4 accent-blue-500">
+              Resoluciones sancionadoras
+            </label>
+          </div>
         </div>
 
         <!-- Normas individuales -->
@@ -2266,7 +2275,8 @@ function leerFiltros(){
     excluir_derogada: document.getElementById('filtroVigente').checked,
     anio: document.getElementById('filtroAnio').value,
     normas: normas,
-    incluir_resoluciones: document.getElementById('filtroResoluciones').checked,
+    incluir_apelacion: document.getElementById('filtroApelacion').checked,
+    incluir_sancionadoras: document.getElementById('filtroSancionadoras').checked,
   };
 }
 async function enviar(){

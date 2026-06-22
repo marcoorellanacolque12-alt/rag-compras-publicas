@@ -48,7 +48,7 @@ def _declino(texto):
 
 # Filtros por DEFECTO de produccion (resoluciones del TCP apagadas salvo opt-in).
 FILTROS_DEFAULT = {"categorias": [], "excluir_derogada": True, "anio": "Todos",
-                   "normas": None, "incluir_resoluciones": False}
+                   "normas": None, "incluir_apelacion": False, "incluir_sancionadoras": False}
 
 
 def _ref_encontrada(filas, esperada):

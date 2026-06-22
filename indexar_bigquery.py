@@ -63,6 +63,7 @@ SCHEMA = [
     # Metadatos para BUSQUEDA HIBRIDA (pre-filtering) y cita.
     bigquery.SchemaField("fase", "STRING"),        # actuaciones_preparatorias|seleccion|ejecucion_contractual|transversal
     bigquery.SchemaField("emisor", "STRING"),      # dato de cita (no filtro)
+    bigquery.SchemaField("subtipo", "STRING"),     # resoluciones TCP: apelacion|sancionadora|otra (NULL en el resto)
     bigquery.SchemaField("anio", "INTEGER"),       # ano de emision del documento
     bigquery.SchemaField("vigente", "BOOLEAN"),    # True = vigente; False = derogada
     bigquery.SchemaField("embedding", "FLOAT64", mode="REPEATED"),
@@ -122,6 +123,7 @@ def _fila_de_chunk(cid, c, emb):
         "texto": c.get("texto"),
         "fase": c.get("fase"),
         "emisor": c.get("emisor"),
+        "subtipo": c.get("subtipo"),
         "anio": c.get("anio"),
         "vigente": c.get("vigente", True),
         "embedding": emb,

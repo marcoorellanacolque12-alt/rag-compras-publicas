@@ -34,6 +34,7 @@ Uso:
 import re
 import json
 import argparse
+import unicodedata
 from google.cloud import storage
 
 # ===================== CONFIGURACION =====================
@@ -457,6 +458,54 @@ def _emitir(bloques, categoria, documento, source_blob, emisor, fase_doc, vigent
     return chunks
 
 
+# ===== SUBTIPO de resolucion del TCP (clasificacion por el VISTO) =====
+# El VISTO distingue el tipo (la sumilla no). Anclas en los NUCLEOS, tolerando plural y
+# espacios. Se normaliza (minusculas, sin tildes) antes de comparar.
+# Anclas en los NUCLEOS, tolerantes a artefactos de OCR/extraccion frecuentes en los PDFs:
+#  - plural y prefijo ('recursos de apelacion', 'apelaci?n' con char corrupto) -> 'apelaci'
+#  - 'administrativo' danado por � ('administra?vo') -> 'administ\S*'
+#  - palabras cortadas por salto de linea ('san-\ncionador') -> se de-hifenan antes.
+_RE_APELACION = re.compile(r"recursos?\s+de\s+apelaci")
+_RE_SANCIONADOR = re.compile(r"procedimiento\s+administ\S*\s+sancionad")
+_RE_VISTO = re.compile(r"\bvisto\b")
+
+
+def _sin_tildes_min(s):
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    s = s.replace("­", "")          # guion suave (U+00AD)
+    s = re.sub(r"-\s+", "", s)           # une palabras partidas por salto de linea
+    return s
+
+
+def _region_visto(texto):
+    """Region del VISTO normalizada (desde 'visto' hasta 'considerando', o ~2500 chars).
+    Devuelve None si no hay un VISTO localizable."""
+    n = _sin_tildes_min(texto)
+    m = _RE_VISTO.search(n)
+    if not m:
+        return None
+    i = m.start()
+    j = n.find("considerando", i)
+    fin = j if (0 <= j - i <= 4000) else i + 2500
+    return n[i:fin]
+
+
+def clasificar_subtipo(texto):
+    """Clasifica una resolucion del TCP por su VISTO. Devuelve (subtipo, motivo):
+    subtipo in {apelacion, sancionadora, otra}; motivo para diagnostico
+    ('recurso de apelacion' | 'procedimiento administrativo sancionador' |
+    'no_visto' | 'sin_frase')."""
+    region = _region_visto(texto)
+    if region is None:
+        return "otra", "no_visto"
+    if _RE_APELACION.search(region):
+        return "apelacion", "recurso de apelacion"
+    if _RE_SANCIONADOR.search(region):
+        return "sancionadora", "procedimiento administrativo sancionador"
+    return "otra", "sin_frase"
+
+
 def chunkear_documento(texto, categoria, documento, source_blob, vigente=True):
     """Trocea un documento segun su categoria y devuelve la lista de chunks con metadata."""
     texto = limpiar(texto)
@@ -486,6 +535,12 @@ def chunkear_documento(texto, categoria, documento, source_blob, vigente=True):
 
     chunks = _emitir(bloques, categoria, documento, source_blob, emisor, fase_doc, vigente)
     chunks += _emitir(anexos, categoria, documento, source_blob, emisor, fase_doc, vigente)
+
+    # SUBTIPO por el VISTO: solo resoluciones del TCP; NULL en el resto. Mismo valor en
+    # TODOS los chunks de la resolucion. (Metadato: NO afecta vectores ni recuperacion aun.)
+    subtipo = clasificar_subtipo(texto)[0] if categoria == "resoluciones_tribunal" else None
+    for ch in chunks:
+        ch["subtipo"] = subtipo
 
     # chunk_id GLOBALMENTE UNICO por documento (indice secuencial + tipo/referencia).
     for seq, ch in enumerate(chunks, start=1):

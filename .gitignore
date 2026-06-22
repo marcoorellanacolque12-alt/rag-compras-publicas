@@ -25,6 +25,7 @@
 !responder.py
 !reset_corpus.py
 !config_emb.py
+!backfill_subtipos.py
 !citas.py
 
 # Aplicacion web (API + UI) y despliegue

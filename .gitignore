@@ -42,3 +42,9 @@
 # Tests
 !tests/
 !tests/*.py
+
+# 3) Re-ignorar artefactos generados dentro de carpetas ya incluidas
+#    (el whitelist de arriba reincluye eval/ y tests/, asi que los
+#     subdirectorios generados hay que excluirlos explicitamente).
+__pycache__/
+eval/reportes/

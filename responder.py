@@ -332,7 +332,8 @@ def listar_normas():
         did = r["doc_id"] or ""
         out.append({
             "doc_id": did,
-            "label": doc_label(r["documento"], did),
+            "documento": r["documento"],                 # slug crudo (para derivar el nombre)
+            "label": doc_label(r["documento"], did),     # etiqueta base (el endpoint la re-resuelve)
             "categoria": r["categoria"],
             "anio": r["anio"],
             "vigente": bool(r["vigente"]) if r["vigente"] is not None else True,
@@ -611,12 +612,14 @@ def doc_label(documento, chunk_id=None):
     return _titulo_legible(d)
 
 
-def formato_cita(fila):
+def formato_cita(fila, nombre=None):
     """Cita NATURAL segun el tipo de referencia (reemplaza el viejo 'Art. X' para todo).
     Si la fila no tiene tipo_referencia/referencia (corpus aun no recargado), cae al
-    esquema anterior basado en articulo_num."""
+    esquema anterior basado en articulo_num.
+    `nombre`: si se pasa, se usa como nombre del documento en vez de doc_label (capa de
+    presentacion: nombre_mostrar resuelto). Permite re-armar la cita con el nombre editado."""
     get = fila.get if hasattr(fila, "get") else (lambda k, d=None: fila[k] if k in fila else d)
-    doc = doc_label(get("documento"), get("chunk_id"))
+    doc = nombre if nombre else doc_label(get("documento"), get("chunk_id"))
     tipo = get("tipo_referencia")
     ref = get("referencia")
     if not ref:
@@ -633,6 +636,84 @@ def formato_cita(fila):
     if tipo == "anexo":
         return f"{doc}, {ref}"          # ref = 'Anexo 2' / 'Formato 6'
     return f"{doc}, {ref}"              # seccion u otros
+
+
+# ======================= NOMBRE LEGIBLE (capa de presentacion) =======================
+# resolver_nombre(documento) por prioridad: override (lo maneja app.py, con SQLite) ->
+# nombre_derivado(): mapa curado de singulares -> derivacion por tipo -> fallback legible.
+# Es PRESENTACION pura: no toca embeddings/recuperacion/jerarquia/subtipo. Corre EN VIVO en
+# cada render (lista de Normas y citas), asi cualquier documento NUEVO se auto-etiqueta sin
+# intervencion, siempre que su dato base (numero, etc.) este en `documento`.
+
+_RE_DOC_ID_BIB = re.compile(r'^(bib_[0-9a-f]+)__')
+
+
+def doc_id_de(documento, chunk_id=None):
+    """Identificador UNICO de documento (espejo de _DOC_ID_SQL): para chunks de Biblioteca,
+    el prefijo bib_<hash> del chunk_id; para el corpus, el propio `documento`. Es la clave de
+    override y la que enlaza una cita con su norma para propagar renombrados."""
+    m = _RE_DOC_ID_BIB.match(str(chunk_id or ""))
+    return m.group(1) if m else documento
+
+
+# --- Mapa curado de singulares: (predicado sobre documento.lower()) -> nombre oficial. ---
+def _es_ley_general(dl):
+    return "ley-general-de-contrataciones" in dl and "reglamento" not in dl
+
+_CURADO_SINGULARES = [
+    (_es_ley_general, "Ley N° 32069 – Ley General de Contrataciones Públicas"),
+    (lambda dl: "reglamento-de-la-ley-de-contrataciones" in dl or "ref-reglamento" in dl,
+     "Reglamento de la Ley N° 32069 (DS 009-2025-EF)"),
+    (lambda dl: "30225" in dl, "Ley N° 30225 – Ley de Contrataciones del Estado (TUO)"),
+    (lambda dl: "344-2018" in dl, "Reglamento de la Ley N° 30225 (DS 344-2018-EF)"),
+    (lambda dl: "27444" in dl, "Ley N° 27444 – Ley del Procedimiento Administrativo General (TUO)"),
+    (lambda dl: "codigo-civil" in dl, "Código Civil"),
+]
+
+
+def _numero_resolucion(documento):
+    """Extrae el numero completo de una resolucion desde `documento` (ya trae el numero).
+    Tolera el formato canonico (resolucion-n-8736-2025-tcp-s5) y los irregulares
+    (0437-2026, 04813-2026-tcp-s2). Devuelve p.ej. '8736-2025-TCP-S5' o None si no hay numero."""
+    post = _RE_ID_PREFIJO.sub('', documento or '').lower()
+    m = re.search(r'resoluci[oó]n[\s_\-]*n?[º°\.\s_\-]*([0-9].*)$', post)
+    core = (m.group(1) if m else post).strip(' -_')
+    if not re.match(r'^\d', core):          # no parece un numero de resolucion
+        return None
+    core = re.sub(r'[\s_]+', '-', core)
+    core = re.sub(r'-{2,}', '-', core).strip('-')
+    return core.upper()
+
+
+def _numero_opinion(documento):
+    """Numero y emisor de una opinion desde `documento` (opinion-d042-2025-oece-dtn) ->
+    ('D042-2025', 'OECE'). Devuelve (numero|None, emisor|'')."""
+    post = _RE_ID_PREFIJO.sub('', documento or '').lower()
+    m = re.search(r'opini[oó]n[\s_\-]*n?[º°\.\s_\-]*([a-z]?\d+[\-/]\d{4})', post)
+    num = m.group(1).upper().replace('/', '-') if m else None
+    emisor = "OECE" if "oece" in post else ("DGA" if "dga" in post else "")
+    return num, emisor
+
+
+def nombre_derivado(documento, categoria=None, numero=None):
+    """Nombre legible SIN overrides (puro): curado -> derivacion por tipo -> fallback legible.
+    `numero`: si se provee (no usado hoy; reservado por si se persiste), tiene prioridad sobre
+    la extraccion desde `documento`."""
+    dl = (documento or "").lower()
+    for pred, nombre in _CURADO_SINGULARES:
+        if pred(dl):
+            return nombre
+    if categoria == "resoluciones_tribunal":
+        num = numero or _numero_resolucion(documento)
+        if num:
+            return f"Resolución N° {num}"
+    elif categoria == "opiniones":
+        num, emisor = _numero_opinion(documento)
+        if num:
+            return f"Opinión N° {num}" + (f"/{emisor}" if emisor else "")
+    # directivas (sin numero en `documento`), documentos_orientacion y cualquier otro:
+    # titulo legible derivado del nombre de archivo.
+    return _titulo_legible(documento)
 
 
 def construir_contexto(filas):

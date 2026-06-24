@@ -41,6 +41,7 @@ Ejecutar en local:
 
 import io
 import os
+import re
 import glob
 import uuid
 import json
@@ -64,6 +65,7 @@ from responder import (
     embeber_para_indexar, indexar_chunks, eliminar_por_prefijo,
     con_reintentos, doc_label, listar_normas, formato_cita,
     generar_respuesta,   # generacion UNIFICADA (prompt+system identicos en endpoint/CLI/eval)
+    nombre_derivado, doc_id_de,   # capa de presentacion: nombre legible/editable por documento
 )
 # Motores de extraccion (en memoria): PDF+OCR, DOCX, Excel/CSV->Markdown, imagen->OCR.
 from extraccion_texto import (
@@ -223,6 +225,24 @@ def _init_db():
             con.commit()
             con.execute("PRAGMA foreign_keys = ON")
             print("[migracion] conversaciones.caso_id ahora es NULLABLE (Consulta General).")
+
+        # Nombre legible EDITABLE de las normas (corpus/Biblioteca): solo filas EDITADAS.
+        # La clave es el doc_id (espejo de _DOC_ID_SQL). Sin override -> nombre derivado.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS overrides_nombre (
+                documento_id TEXT PRIMARY KEY,
+                nombre       TEXT NOT NULL,
+                fecha        TEXT NOT NULL
+            )""")
+        con.commit()
+
+        # MIGRACION ADITIVA: nombre_mostrar editable por documento del caso (NULL = filename
+        # limpio). Idempotente: solo agrega la columna si no existe.
+        cols = {c["name"] for c in con.execute("PRAGMA table_info(fuentes)").fetchall()}
+        if "nombre_mostrar" not in cols:
+            con.execute("ALTER TABLE fuentes ADD COLUMN nombre_mostrar TEXT")
+            con.commit()
+            print("[migracion] fuentes.nombre_mostrar agregada (nombre editable del documento).")
     finally:
         con.close()
 
@@ -314,8 +334,60 @@ def conversacion_de_caso(conv_id, caso_id):
         con.close()
 
 
+_RE_EXT = re.compile(r'\.(pdf|docx?|xlsx?|csv|png|jpe?g|gif|webp|txt|md|zip)$', re.IGNORECASE)
+
+
+def _nombre_archivo_limpio(nombre):
+    """Filename legible: sin extension, separadores -> espacios."""
+    s = _RE_EXT.sub('', nombre or '')
+    s = re.sub(r'\s+', ' ', s.replace('_', ' ').replace('-', ' ')).strip()
+    return s or (nombre or '')
+
+
+def _nombres_caso_actuales(ids):
+    """Mapa id -> nombre a mostrar (nombre_mostrar o filename limpio) para fuentes del caso."""
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return {}
+    marcas = ",".join("?" * len(ids))
+    con = _conn()
+    try:
+        rows = con.execute(
+            f"SELECT id, nombre, nombre_mostrar FROM fuentes WHERE id IN ({marcas})", ids).fetchall()
+    finally:
+        con.close()
+    return {r["id"]: (r["nombre_mostrar"] or _nombre_archivo_limpio(r["nombre"])) for r in rows}
+
+
+def _reresolver_meta(meta):
+    """Re-resuelve los nombres de las citas guardadas POR IDENTIFICADOR (no por el string
+    congelado), para que un renombrado se propague a hilos ya guardados al recargar. Defensivo:
+    deja intactas las entradas viejas sin documento_id y las fuentes del caso que ya no existen."""
+    if not isinstance(meta, dict):
+        return meta
+    fnorm = meta.get("fuentes_normativas") or []
+    ids = [fr.get("documento_id") for fr in fnorm if isinstance(fr, dict) and fr.get("documento_id")]
+    cache = _overrides_nombre(ids) if ids else {}
+    for fr in fnorm:
+        if not isinstance(fr, dict) or not fr.get("documento_id"):
+            continue                                  # entrada antigua: se respeta el string guardado
+        slug = fr.get("documento_slug") or fr.get("documento_id")
+        nombre = resolver_nombre(fr["documento_id"], slug, fr.get("categoria"), _cache=cache)
+        fr["documento"] = nombre
+        fr["cita"] = formato_cita({"documento": slug, "tipo_referencia": fr.get("tipo_referencia"),
+                                   "referencia": fr.get("referencia"),
+                                   "articulo_num": fr.get("articulo_num")}, nombre=nombre)
+    fusadas = meta.get("fuentes_usadas") or []
+    actuales = _nombres_caso_actuales([fu.get("id") for fu in fusadas if isinstance(fu, dict)])
+    for fu in fusadas:
+        if isinstance(fu, dict) and fu.get("id") in actuales:
+            fu["nombre"] = actuales[fu["id"]]         # propaga el rename del documento del caso
+    return meta
+
+
 def leer_mensajes(conv_id):
-    """Mensajes de una conversacion en orden. `meta` se devuelve ya parseado (o None)."""
+    """Mensajes de una conversacion en orden. `meta` se devuelve ya parseado (o None) y con los
+    nombres de las citas RE-RESUELTOS por id (propagacion de renombrados)."""
     con = _conn()
     try:
         rows = con.execute("SELECT rol, texto, meta FROM mensajes WHERE conversacion_id=? "
@@ -324,8 +396,8 @@ def leer_mensajes(conv_id):
         con.close()
     out = []
     for r in rows:
-        out.append({"rol": r["rol"], "texto": r["texto"],
-                    "meta": json.loads(r["meta"]) if r["meta"] else None})
+        meta = json.loads(r["meta"]) if r["meta"] else None
+        out.append({"rol": r["rol"], "texto": r["texto"], "meta": _reresolver_meta(meta)})
     return out
 
 
@@ -420,8 +492,12 @@ def actualizar_fuente(fid, **campos):
 
 
 def _fila_publica(r):
+    cols = r.keys()
+    nm = r["nombre_mostrar"] if "nombre_mostrar" in cols else None
     return {
         "id": r["id"], "caso_id": r["caso_id"], "nombre": r["nombre"],
+        "nombre_mostrar": nm,                                       # override crudo (o None)
+        "nombre_display": nm or _nombre_archivo_limpio(r["nombre"]),  # lo que se muestra
         "etiquetas": json.loads(r["etiquetas"] or "[]"),
         "n_chars": r["n_chars"], "metodo": r["metodo"],
         "estado": r["estado"], "error": r["error"],
@@ -650,22 +726,87 @@ class Mensaje(BaseModel):
 
 
 # ============================ HELPERS RAG ============================
+# ===================== NOMBRE LEGIBLE EDITABLE (presentacion) =====================
+def _overrides_nombre(documento_ids=None):
+    """Mapa documento_id -> nombre override. Si se pasa una lista, filtra a esos ids."""
+    con = _conn()
+    try:
+        if documento_ids:
+            ids = [i for i in documento_ids if i]
+            if not ids:
+                return {}
+            marcas = ",".join("?" * len(ids))
+            rows = con.execute(
+                f"SELECT documento_id, nombre FROM overrides_nombre WHERE documento_id IN ({marcas})",
+                ids).fetchall()
+        else:
+            rows = con.execute("SELECT documento_id, nombre FROM overrides_nombre").fetchall()
+    finally:
+        con.close()
+    return {r["documento_id"]: r["nombre"] for r in rows}
+
+
+def resolver_nombre(documento_id, documento=None, categoria=None, numero=None, _cache=None):
+    """Nombre a MOSTRAR de una norma, por prioridad: override del usuario -> nombre derivado
+    (curado/derivacion/fallback). `_cache`: mapa de overrides ya cargado (evita N consultas)."""
+    if _cache is not None:
+        ov = _cache.get(documento_id)
+    else:
+        ov = _overrides_nombre([documento_id]).get(documento_id)
+    if ov:
+        return ov
+    return nombre_derivado(documento or documento_id, categoria, numero)
+
+
+def fijar_nombre_override(documento_id, nombre):
+    """Fija/actualiza el override de una norma; nombre vacio -> elimina (vuelve al derivado)."""
+    documento_id = (documento_id or "").strip()
+    nombre = (nombre or "").strip()
+    if not documento_id:
+        return
+    with _db_lock:
+        con = _conn()
+        try:
+            if nombre:
+                con.execute(
+                    "INSERT INTO overrides_nombre (documento_id, nombre, fecha) VALUES (?,?,?) "
+                    "ON CONFLICT(documento_id) DO UPDATE SET nombre=excluded.nombre, fecha=excluded.fecha",
+                    (documento_id, nombre, _ahora()))
+            else:
+                con.execute("DELETE FROM overrides_nombre WHERE documento_id=?", (documento_id,))
+            con.commit()
+        finally:
+            con.close()
+
+
 def _fuentes_normativas(filas):
     # 'numero' = orden 1-based, coincide con [Fragmento N] de construir_contexto y con
     # los marcadores [N] que el modelo coloca en la respuesta.
-    return [{
-        "numero": i,
-        "documento": doc_label(f["documento"], f.get("chunk_id")),   # etiquetado unificado
-        "cita": formato_cita(f),                                      # cita natural lista para mostrar
-        "tipo_referencia": f.get("tipo_referencia"),
-        "referencia": f.get("referencia"),
-        "fase": f.get("fase"),
-        "emisor": f.get("emisor"),
-        "texto": f["texto"],                                          # texto TEXTUAL del fragmento
-        "articulo_num": f["articulo_num"],
-        "articulo_titulo": f["articulo_titulo"],
-        "relevancia": round(1 - f["distance"], 3),
-    } for i, f in enumerate(filas, start=1)]
+    # Se guarda el IDENTIFICADOR (documento_id + slug + categoria) ademas del nombre resuelto,
+    # para que las citas se re-resuelvan POR ID al recargar y un renombrado se propague.
+    ids = [doc_id_de(f["documento"], f.get("chunk_id")) for f in filas]
+    cache = _overrides_nombre(ids)
+    out = []
+    for i, f in enumerate(filas, start=1):
+        did = doc_id_de(f["documento"], f.get("chunk_id"))
+        nombre = resolver_nombre(did, f["documento"], f.get("categoria"), _cache=cache)
+        out.append({
+            "numero": i,
+            "documento": nombre,                                      # nombre a mostrar (resuelto)
+            "documento_id": did,                                      # clave para re-resolver/propagar
+            "documento_slug": f["documento"],                         # slug crudo (re-derivar)
+            "categoria": f.get("categoria"),
+            "cita": formato_cita(f, nombre=nombre),                   # cita natural con el nombre resuelto
+            "tipo_referencia": f.get("tipo_referencia"),
+            "referencia": f.get("referencia"),
+            "fase": f.get("fase"),
+            "emisor": f.get("emisor"),
+            "texto": f["texto"],                                      # texto TEXTUAL del fragmento
+            "articulo_num": f["articulo_num"],
+            "articulo_titulo": f["articulo_titulo"],
+            "relevancia": round(1 - f["distance"], 3),
+        })
+    return out
 
 
 def _extraer_texto(nombre: str, data: bytes):
@@ -1109,10 +1250,51 @@ def api_borrar_biblioteca(bid: str):
 @app.get("/api/normas")
 def api_listar_normas():
     try:
-        return listar_normas()
+        normas = listar_normas()
+        cache = _overrides_nombre([n.get("doc_id") for n in normas])   # 1 sola consulta
+        for n in normas:
+            n["label"] = resolver_nombre(n.get("doc_id"), n.get("documento"),
+                                         n.get("categoria"), _cache=cache)
+            n["editado"] = n.get("doc_id") in cache                    # tiene override del usuario
+        return normas
     except Exception as e:
         return JSONResponse(status_code=503, content={
             "error": f"No se pudieron listar las normas: {type(e).__name__}: {e}"})
+
+
+# ---- Renombrar normas (overrides_nombre) y documentos del caso (fuentes.nombre_mostrar) ----
+class NombreNorma(BaseModel):
+    documento_id: str
+    nombre: str = ""        # vacio = revertir al nombre derivado
+
+
+@app.post("/api/normas/nombre")
+def api_fijar_nombre_norma(body: NombreNorma):
+    fijar_nombre_override(body.documento_id, body.nombre)
+    did = (body.documento_id or "").strip()
+    return {"ok": True, "documento_id": did,
+            "nombre": resolver_nombre(did, did, None)}
+
+
+class NombreFuente(BaseModel):
+    nombre: str = ""        # vacio = revertir al filename limpio
+
+
+@app.post("/api/casos/{cid}/fuentes/{fid}/nombre")
+def api_renombrar_fuente(cid: str, fid: str, body: NombreFuente):
+    nombre = (body.nombre or "").strip() or None
+    with _db_lock:
+        con = _conn()
+        try:
+            cur = con.execute("UPDATE fuentes SET nombre_mostrar=? WHERE id=? AND caso_id=?",
+                              (nombre, fid, cid))
+            con.commit()
+        finally:
+            con.close()
+    if not cur.rowcount:
+        return JSONResponse(status_code=404, content={"error": "Fuente no encontrada."})
+    f = obtener_fuente_publica(fid)
+    return {"ok": True, "nombre_display": f["nombre_display"] if f else nombre}
 
 
 # ---- Chat / Analisis (aislado por caso) ----
@@ -2104,18 +2286,34 @@ function pintarFuentes(){
       const badge = etiq ? '<span class="text-[10px] text-green-400 font-semibold">'+etiq+'</span>' : '';
       estadoHtml = '<div class="text-[10px] text-slate-500 mb-1">'+(f.n_chars||0).toLocaleString()+' chars '+badge+'</div>';
     }
+    const nombreMostrar = f.nombre_display || f.nombre;
     card.innerHTML =
       '<div class="flex items-start gap-2">' + toggle +
         '<div class="flex-1 min-w-0">' +
-          '<div class="text-xs font-semibold text-slate-100 truncate" title="'+esc(f.nombre)+'">'+esc(f.nombre)+'</div>' +
+          '<div class="text-xs font-semibold text-slate-100 truncate" title="'+esc(f.nombre)+'">'+esc(nombreMostrar)+'</div>' +
           estadoHtml +
           '<div class="flex flex-wrap gap-1">'+tagsHtml+'</div>' +
         '</div>' +
+        '<button onclick="renombrarFuente(\''+f.id+'\')" title="Renombrar" class="text-slate-500 hover:text-blue-400 text-xs leading-none">✎</button>' +
         '<button onclick="borrarFuente(\''+f.id+'\')" class="text-slate-500 hover:text-red-400 text-sm leading-none">&times;</button>' +
       '</div>';
     cont.appendChild(card);
   });
   contar();
+}
+async function renombrarFuente(id){
+  const f = fuentes.find(x=>x.id===id); if(!f || !casoActual) return;
+  const nuevo = prompt('Nombre a mostrar para este documento (vacío = restaurar el filename):',
+                       f.nombre_mostrar || f.nombre_display || f.nombre || '');
+  if(nuevo === null) return;
+  try{
+    const r = await fetch('/api/casos/'+casoActual.id+'/fuentes/'+id+'/nombre', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({nombre: nuevo})});
+    if(!r.ok) throw 0;
+    const d = await r.json();
+    f.nombre_display = d.nombre_display; f.nombre_mostrar = nuevo.trim() || null;
+    pintarFuentes();
+  }catch(e){ alert('No se pudo renombrar el documento.'); }
 }
 function toggleFuente(id, val){ const f=fuentes.find(x=>x.id===id); if(f){ f.activo=val; } contar(); pintarFuentes(); }
 
@@ -2279,9 +2477,24 @@ function renderNormas(){
     meta.className = 'text-slate-500 text-[10px] ml-auto whitespace-nowrap pl-2';
     meta.textContent = [(CAT_LABEL[n.categoria] || n.categoria || ''), (n.anio || 's/año')]
       .filter(Boolean).join(' · ');
-    lab.append(cb, txt, meta);
+    const edit = document.createElement('button');
+    edit.type = 'button'; edit.title = 'Renombrar';
+    edit.className = 'text-slate-500 hover:text-blue-400 text-[11px] flex-none pl-1' + (n.editado ? ' text-blue-400' : '');
+    edit.textContent = '✎';
+    edit.onclick = (e)=>{ e.preventDefault(); e.stopPropagation(); renombrarNorma(n.doc_id, n.label); };
+    lab.append(cb, txt, meta, edit);
     cont.appendChild(lab);
   });
+}
+async function renombrarNorma(docId, actual){
+  const nuevo = prompt('Nombre a mostrar para esta norma (vacío = restaurar el automático):', actual || '');
+  if(nuevo === null) return;
+  try{
+    const r = await fetch('/api/normas/nombre', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({documento_id: docId, nombre: nuevo})});
+    if(!r.ok) throw 0;
+    await cargarNormas();           // recarga el catalogo con el nombre resuelto
+  }catch(e){ alert('No se pudo renombrar la norma.'); }
 }
 function marcarNormas(val){
   document.querySelectorAll('#filtroNormas input[type=checkbox]').forEach(i=>{ i.checked = val; _normaState[i.value] = val; });

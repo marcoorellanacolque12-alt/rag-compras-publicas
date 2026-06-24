@@ -53,7 +53,19 @@ CATEGORIAS_VALIDAS = {
 }
 
 # ---- Fronteras de troceo por tipo ----
-RE_ARTICULO = re.compile(r'(?im)^[ \t]*art[ií]culo[ \t]+(\d+)[ \t]*[\.\-°ºª)]*[ \t]*(.*)$')
+# Encabezado REAL de articulo: "Artículo NN" a inicio de linea, con el numero SEGUIDO de un
+# DELIMITADOR de encabezado (° º ª . - ) : o el char de reemplazo OCR U+FFFD). Ese delimitador
+# es el discriminador decisivo frente a las REFERENCIAS CRUZADAS del cuerpo ("...artículo 55
+# de la Ley...", "...artículo 102 del Reglamento..."), donde el numero va seguido de espacio +
+# conector, SIN delimitador, y que el wrap del PDF dejaba a inicio de linea -> el patron viejo
+# ([.\-°ºª)]* con '*') las tomaba como frontera y rotulaba mal el chunk (bug: "Art. 55" sobre
+# contenido del Art. 102). Verificado en Ley 32069 (100 arts, 1..100 sin huecos) y Reglamento
+# DS 009-2025-EF (389 arts, 1..389 sin huecos): detecta todos los encabezados y descarta las 18
+# referencias cruzadas. Titulos que empiezan con "De/Del" (Art. 244 "De la entidad...", Art. 270
+# "Del equipo...") se conservan porque traen el delimitador antes del titulo. OCR: limpiar()
+# de-hifena los cortes de palabra y U+FFFD se acepta como delimitador. Se prioriza PRECISION
+# (citas legales): NO se aceptan encabezados sin delimitador (evita inventar numeros de articulo).
+RE_ARTICULO = re.compile(r'(?im)^[ \t]*art[ií]culo[ \t]+(\d+)[ \t]*[\.\-°ºª):�]+[ \t]*(.*)$')
 # Numeral de directiva: "5", "5.2", "5.2.1" al inicio de linea seguido de un titulo.
 RE_NUMERAL = re.compile(r'(?im)^[ \t]*(\d{1,2}(?:\.\d{1,2}){0,3})[ \t]*[\.\)]?[ \t]+([A-ZÁÉÍÓÚÑ].{2,150})$')
 RE_DISPOSICION = re.compile(r'(?im)^[ \t]*(DISPOSICI[OÓ]N[ \t]+[A-ZÁÉÍÓÚÑ].{0,120})$')
@@ -110,6 +122,12 @@ FASE_DEFAULT_POR_CAT = {
 # ============================ UTILIDADES ============================
 def limpiar(texto):
     texto = texto.replace("\r\n", "\n")
+    # De-hifenado OCR / word-wrap: une la palabra cortada por guion + salto de linea
+    # ("Artícu-\nlo" -> "Artículo"; "contrata-\nción" -> "contratación"), para que el
+    # encabezado de articulo se reconozca aunque el PDF lo parta. Conservador: SOLO
+    # letra+guion+\n+letra (no toca "DS-\n009" ni vinetas con guion).
+    texto = re.sub(
+        r'(?<=[A-Za-zÁÉÍÓÚÑáéíóúñ])[\-­]\n[ \t]*(?=[A-Za-zÁÉÍÓÚÑáéíóúñ])', '', texto)
     texto = re.sub(r'[ \t]+', ' ', texto)
     texto = re.sub(r'\n{3,}', '\n\n', texto)
     return texto.strip()

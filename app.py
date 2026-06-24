@@ -1535,27 +1535,44 @@ HTML = r"""
       <!-- FILTROS NORMATIVOS — solo visibles en Consulta General (lo gobierna marcarModoUI) -->
       <div id="filtrosBar" class="flex flex-col gap-5" style="display:none">
 
-        <!-- Categoria / Año / Vigencia -->
+        <!-- Categoria (checkboxes) / Resoluciones / Año / Vigencia -->
         <div class="flex flex-col gap-3">
-          <div class="flex flex-col gap-1">
-            <label class="text-xs font-medium text-slate-300">Categoría <span class="text-slate-500 font-normal">(multiselección)</span></label>
-            <select id="filtroCategorias" multiple size="5"
-                    class="bg-slate-800 border border-slate-700 text-slate-200 rounded-md text-xs px-2 py-1.5 outline-none focus:border-blue-500">
-              <optgroup label="Marco legal y reglamentario" class="bg-slate-900 text-slate-300">
-                <option value="leyes_y_reglamentos">Leyes y reglamentos</option>
-              </optgroup>
-              <optgroup label="Directivas y lineamientos" class="bg-slate-900 text-slate-300">
-                <option value="directivas">Directivas y lineamientos</option>
-              </optgroup>
-              <optgroup label="Herramientas y formatos estándar" class="bg-slate-900 text-slate-300">
-                <option value="documentos_orientacion">Documentos de orientación / formatos</option>
-              </optgroup>
-              <optgroup label="Criterios vinculantes" class="bg-slate-900 text-slate-300">
-                <option value="opiniones">Opiniones</option>
-              </optgroup>
-            </select>
-            <span class="text-[10px] text-slate-500">Sin selección = todas (las resoluciones del Tribunal se controlan abajo).</span>
+          <div class="flex flex-col gap-1.5">
+            <label class="text-xs font-medium text-slate-300">Categoría <span class="text-slate-500 font-normal">(marco normativo)</span></label>
+            <div id="filtroCategorias" class="flex flex-col gap-1.5">
+              <label class="flex items-center gap-2 text-xs text-slate-300">
+                <input type="checkbox" class="filtroCat w-4 h-4 accent-blue-500" value="leyes_y_reglamentos" checked onchange="renderNormas()">
+                Leyes y reglamentos
+              </label>
+              <label class="flex items-center gap-2 text-xs text-slate-300">
+                <input type="checkbox" class="filtroCat w-4 h-4 accent-blue-500" value="directivas" checked onchange="renderNormas()">
+                Directivas y lineamientos
+              </label>
+              <label class="flex items-center gap-2 text-xs text-slate-300">
+                <input type="checkbox" class="filtroCat w-4 h-4 accent-blue-500" value="opiniones" checked onchange="renderNormas()">
+                Opiniones
+              </label>
+              <label class="flex items-center gap-2 text-xs text-slate-300">
+                <input type="checkbox" class="filtroCat w-4 h-4 accent-blue-500" value="documentos_orientacion" onchange="renderNormas()">
+                Documentos de orientación / formatos
+              </label>
+            </div>
+            <span class="text-[10px] text-slate-500">Marca categorías para ampliar el marco.</span>
           </div>
+
+          <!-- Resoluciones del Tribunal: categoria con subtipos anidados (sin lista por-documento) -->
+          <div class="flex flex-col gap-1.5 border-t border-slate-800/70 pt-2">
+            <span class="text-xs font-medium text-slate-300">Resoluciones del Tribunal <span class="text-slate-500 font-normal">(por subtipo)</span></span>
+            <label class="flex items-center gap-2 text-xs text-slate-300">
+              <input type="checkbox" id="filtroApelacion" class="w-4 h-4 accent-blue-500">
+              Resoluciones de apelación
+            </label>
+            <label class="flex items-center gap-2 text-xs text-slate-300">
+              <input type="checkbox" id="filtroSancionadoras" class="w-4 h-4 accent-blue-500">
+              Resoluciones sancionadoras
+            </label>
+          </div>
+
           <div class="flex flex-col gap-1">
             <label class="text-xs font-medium text-slate-300">Año de emisión</label>
             <select id="filtroAnio"
@@ -1571,17 +1588,6 @@ HTML = r"""
             <input type="checkbox" id="filtroVigente" checked class="w-4 h-4 accent-blue-500">
             Excluir normativa derogada
           </label>
-          <div class="flex flex-col gap-1.5 border-t border-slate-800/70 pt-2">
-            <span class="text-[11px] text-slate-500">Resoluciones del Tribunal (jurisprudencia, por subtipo):</span>
-            <label class="flex items-center gap-2 text-xs text-slate-300">
-              <input type="checkbox" id="filtroApelacion" class="w-4 h-4 accent-blue-500">
-              Resoluciones de apelación
-            </label>
-            <label class="flex items-center gap-2 text-xs text-slate-300">
-              <input type="checkbox" id="filtroSancionadoras" class="w-4 h-4 accent-blue-500">
-              Resoluciones sancionadoras
-            </label>
-          </div>
         </div>
 
         <!-- Normas individuales -->
@@ -1597,7 +1603,7 @@ HTML = r"""
                class="bg-slate-800/60 border border-slate-700/60 rounded-md text-xs px-2 py-2 max-h-[260px] overflow-y-auto space-y-1.5">
             <p class="text-slate-500 text-[10px]">Cargando normas...</p>
           </div>
-          <span class="text-[10px] text-slate-500">Todas activas por defecto; desactiva las que no quieras consultar.</span>
+          <span class="text-[10px] text-slate-500">Solo documentos de las categorías marcadas; desactiva los que no quieras consultar.</span>
         </div>
 
       </div>
@@ -2226,49 +2232,74 @@ function addMsg(html, lado){
   b.innerHTML = html; wrap.appendChild(b); chat.appendChild(wrap);
   chat.scrollTop = chat.scrollHeight; return b;
 }
-// Carga las normas (corpus + Biblioteca) en el menu de seleccion individual.
+// Catalogo completo de normas (corpus + Biblioteca) y estado de marcado por documento.
+let _normasAll = [];                 // se carga una vez; renderNormas() filtra por categoria marcada
+const _normaState = {};              // doc_id -> marcada? (preserva desmarques al re-renderizar)
+
+// Categorias TRANSVERSALES marcadas (las resoluciones del Tribunal no son checkbox aqui).
+function categoriasMarcadas(){
+  return new Set(Array.from(document.querySelectorAll('#filtroCategorias .filtroCat:checked')).map(c=>c.value));
+}
+
+// Carga las normas (corpus + Biblioteca) una sola vez y delega el pintado a renderNormas.
 async function cargarNormas(){
   const cont = document.getElementById('filtroNormas');
   cont.innerHTML = '<p class="text-slate-500 text-[10px]">Cargando normas...</p>';
   try{
     const r = await fetch('/api/normas');
     const normas = await r.json();
-    if(!Array.isArray(normas) || !normas.length){
-      cont.innerHTML = '<p class="text-slate-500 text-[10px]">No hay normas indexadas.</p>'; return;
-    }
-    cont.innerHTML = '';
-    normas.forEach(n=>{
-      const lab = document.createElement('label');
-      lab.className = 'flex items-center gap-1.5 text-slate-200';
-      const cb = document.createElement('input');
-      cb.type = 'checkbox'; cb.className = 'w-3.5 h-3.5 accent-blue-500 flex-none';
-      cb.checked = true; cb.value = n.doc_id;     // value por propiedad (sin riesgo de inyeccion)
-      const txt = document.createElement('span');
-      txt.className = 'truncate'; txt.title = n.label; txt.textContent = n.label;
-      const meta = document.createElement('span');
-      meta.className = 'text-slate-500 text-[10px] ml-auto whitespace-nowrap pl-2';
-      meta.textContent = [(CAT_LABEL[n.categoria] || n.categoria || ''), (n.anio || 's/año')]
-        .filter(Boolean).join(' · ');
-      lab.append(cb, txt, meta);
-      cont.appendChild(lab);
-    });
+    _normasAll = Array.isArray(normas) ? normas : [];
+    renderNormas();
   }catch(e){ cont.innerHTML = '<p class="text-red-400 text-[10px]">Error al cargar normas.</p>'; }
 }
+
+// Pinta la lista de Normas mostrando SOLO documentos de categorias marcadas (nunca
+// resoluciones_tribunal, que no tiene lista por-documento). Preserva los desmarques del usuario;
+// los documentos que reaparecen por primera vez salen marcados (buscar toda la categoria).
+function renderNormas(){
+  const cont = document.getElementById('filtroNormas');
+  if(!cont) return;
+  // 1) Captura el estado actual del DOM antes de reconstruir (persiste desmarques).
+  document.querySelectorAll('#filtroNormas input[type=checkbox]').forEach(i=>{ _normaState[i.value] = i.checked; });
+  if(!_normasAll.length){ cont.innerHTML = '<p class="text-slate-500 text-[10px]">No hay normas indexadas.</p>'; return; }
+  const marcadas = categoriasMarcadas();
+  const visibles = _normasAll.filter(n => n.categoria !== 'resoluciones_tribunal' && marcadas.has(n.categoria));
+  if(!visibles.length){ cont.innerHTML = '<p class="text-slate-500 text-[10px]">Marca una categoría para ver sus normas.</p>'; return; }
+  cont.innerHTML = '';
+  visibles.forEach(n=>{
+    const lab = document.createElement('label');
+    lab.className = 'flex items-center gap-1.5 text-slate-200';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.className = 'w-3.5 h-3.5 accent-blue-500 flex-none';
+    cb.value = n.doc_id;     // value por propiedad (sin riesgo de inyeccion)
+    cb.checked = (n.doc_id in _normaState) ? _normaState[n.doc_id] : true;   // visibles marcadas por defecto
+    const txt = document.createElement('span');
+    txt.className = 'truncate'; txt.title = n.label; txt.textContent = n.label;
+    const meta = document.createElement('span');
+    meta.className = 'text-slate-500 text-[10px] ml-auto whitespace-nowrap pl-2';
+    meta.textContent = [(CAT_LABEL[n.categoria] || n.categoria || ''), (n.anio || 's/año')]
+      .filter(Boolean).join(' · ');
+    lab.append(cb, txt, meta);
+    cont.appendChild(lab);
+  });
+}
 function marcarNormas(val){
-  document.querySelectorAll('#filtroNormas input[type=checkbox]').forEach(i=>{ i.checked = val; });
+  document.querySelectorAll('#filtroNormas input[type=checkbox]').forEach(i=>{ i.checked = val; _normaState[i.value] = val; });
 }
 
 // Lee los Filtros Normativos de la UI (Busqueda Hibrida / pre-filtering).
 function leerFiltros(){
-  const sel = document.getElementById('filtroCategorias');
-  const cats = sel ? Array.from(sel.selectedOptions).map(o=>o.value) : [];
-  // Seleccion individual de normas (Biblioteca): aplica en AMBOS modos (caso y general),
-  // si ya se cargaron las normas. null = sin restriccion (robusto); lista = solo esas;
-  // [] = ninguna seleccionada (busca en cero normas).
+  // Categorias TRANSVERSALES marcadas (Lectura A: marcado = se busca). Sin marcas no se busca
+  // normativa transversal; las resoluciones se controlan por sus toggles de subtipo aparte.
+  const cats = Array.from(document.querySelectorAll('#filtroCategorias .filtroCat:checked')).map(c=>c.value);
+  // Refinamiento por documento dentro de las categorias marcadas. TODAS las visibles marcadas =
+  // sin restriccion por-documento (null: deja pasar la categoria completa y las resoluciones);
+  // si el usuario desmarca algunas, va el subconjunto marcado.
   const ni = document.querySelectorAll('#filtroNormas input[type=checkbox]');
   let normas = null;
   if(ni.length){
-    normas = Array.from(ni).filter(i=>i.checked).map(i=>i.value);
+    const marcadas = Array.from(ni).filter(i=>i.checked).map(i=>i.value);
+    normas = (marcadas.length === ni.length) ? null : marcadas;
   }
   return {
     categorias: cats,

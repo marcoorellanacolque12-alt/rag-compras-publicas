@@ -46,9 +46,12 @@ def _declino(texto):
     return FRASE_DECLINA in (texto or "").lower()
 
 
-# Filtros por DEFECTO de produccion (resoluciones del TCP apagadas salvo opt-in).
-FILTROS_DEFAULT = {"categorias": [], "excluir_derogada": True, "anio": "Todos",
-                   "normas": None, "incluir_apelacion": False, "incluir_sancionadoras": False}
+# Filtros por DEFECTO de produccion: categorias transversales marcadas EXCEPTO
+# documentos_orientacion; resoluciones del TCP apagadas (ambos subtipos) salvo opt-in.
+# Refleja el selector de checkboxes (Lectura A: marcado = se busca).
+FILTROS_DEFAULT = {"categorias": ["leyes_y_reglamentos", "directivas", "opiniones"],
+                   "excluir_derogada": True, "anio": "Todos", "normas": None,
+                   "incluir_apelacion": False, "incluir_sancionadoras": False}
 
 
 def _ref_encontrada(filas, esperada):

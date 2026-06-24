@@ -254,10 +254,17 @@ def _construir_prefiltro(filtros):
         return None, []
     conds, params = [], []
 
+    # CATEGORIAS TRANSVERSALES: lista blanca (Lectura A "marcado = se busca"). Se elimina la
+    # regla "sin seleccion = todas": una categoria desmarcada NO se busca. Las resoluciones del
+    # Tribunal NO son un checkbox aqui (se gobiernan por sus toggles de subtipo, mas abajo), por
+    # eso quedan EXENTAS de esta lista blanca: pasan este gate y la condicion de subtipo decide
+    # si entran. Sin ninguna categoria marcada, solo pueden entrar resoluciones (via sus toggles).
     cats = [c for c in (filtros.get("categorias") or []) if c]
     if cats:
-        conds.append("categoria IN UNNEST(@f_cats)")
+        conds.append("(categoria IN UNNEST(@f_cats) OR categoria = 'resoluciones_tribunal')")
         params.append(bigquery.ArrayQueryParameter("f_cats", "STRING", cats))
+    else:
+        conds.append("categoria = 'resoluciones_tribunal'")
 
     # RESOLUCIONES DEL TRIBUNAL: control FINO por subtipo (toggles independientes). Solo
     # entran los subtipos activados; 'otra' nunca (por ahora, sin control propio). Ambos OFF
@@ -286,16 +293,20 @@ def _construir_prefiltro(filtros):
         conds.append("anio = @f_anio")
         params.append(bigquery.ScalarQueryParameter("f_anio", "INT64", int(anio)))
 
-    # Seleccion INDIVIDUAL de normas (convive con los filtros de arriba, en AND).
-    # None = sin restriccion individual; lista vacia = ninguna norma seleccionada.
+    # Refinamiento INDIVIDUAL de normas (convive con los filtros de arriba, en AND). Aplica solo
+    # a normativa TRANSVERSAL: las resoluciones no tienen lista por-documento (son ~9.940) y se
+    # gobiernan por sus toggles de subtipo, por eso quedan exentas (un refinamiento de documentos
+    # transversales no debe apagar las resoluciones encendidas). None = sin restriccion individual;
+    # lista vacia = ninguna norma transversal -> solo pueden entrar resoluciones (segun toggles).
     normas = filtros.get("normas")
     if normas is not None:
         normas = [n for n in normas if n]
         if normas:
-            conds.append(f"{_DOC_ID_SQL} IN UNNEST(@f_normas)")
+            conds.append(f"({_DOC_ID_SQL} IN UNNEST(@f_normas) "
+                         "OR categoria = 'resoluciones_tribunal')")
             params.append(bigquery.ArrayQueryParameter("f_normas", "STRING", normas))
         else:
-            conds.append("1 = 0")   # seleccion vacia explicita -> no busca en ninguna norma
+            conds.append("categoria = 'resoluciones_tribunal'")
 
     return (" AND ".join(conds) if conds else None), params
 

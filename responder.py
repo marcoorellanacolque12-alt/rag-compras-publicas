@@ -726,36 +726,124 @@ def construir_contexto(filas):
 
 
 # ======================= ORDEN Y FORMATO DE CITAS (presentacion) =======================
-# DOS transformaciones de PRESENTACION sobre el par (respuesta, filas) YA generado. NO tocan
+# Transformaciones de PRESENTACION sobre el par (respuesta, filas) YA generado. NO tocan
 # recuperacion, ranking, generacion, embeddings ni el contenido en BigQuery: solo cambian el
-# ORDEN en que se listan las fuentes citadas y el FORMATO del texto de la cita al mostrarlo.
-_RE_MARCADOR_CITA = re.compile(r"\[(\d+)\]")
+# ORDEN/AGRUPACION de las fuentes citadas y el FORMATO del texto de la cita al mostrarlo.
+
+# Marcador de cita: un numero o un GRUPO de numeros entre corchetes ("[2]" o "[2, 5, 6]").
+_RE_GRUPO_CITA = re.compile(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]")
 
 
-def reordenar_citas_por_autoridad(respuesta, filas):
-    """Reordena las fuentes citadas por JERARQUIA (ORDEN_AUTORIDAD) en vez de por orden de
-    aparicion/relevancia, y RENUMERA de forma consistente los marcadores [N] del cuerpo para
-    que cada [N] siga apuntando a SU fuente en la lista reordenada. Orden estable dentro de la
-    misma categoria (orden original de aparicion como desempate, que ademas conserva contiguas
-    las partes de un mismo articulo). Reusa ORDEN_AUTORIDAD (el mismo orden del ranking de
-    autoridad; no se define un orden nuevo). Devuelve (respuesta_renumerada, filas_reordenadas).
-    PRESENTACION pura: opera sobre lo ya recuperado/generado."""
+def _es_doc_ley_general(documento):
+    """True si el documento es la Ley 32069 (no su Reglamento). Robusto: por el SLUG del
+    documento, no por el cuerpo."""
+    d = (documento or "").lower()
+    return "ley-general-de-contrataciones" in d and "reglamento" not in d
+
+
+def _es_doc_reglamento(documento):
+    """True si el documento es el Reglamento de la Ley de contrataciones (incl. 'ref-reglamento').
+    Robusto: por el SLUG del documento."""
+    d = (documento or "").lower()
+    return "reglamento-de-la-ley-de-contrataciones" in d
+
+
+def _sub_orden_norma(fila):
+    """Sub-orden DENTRO de la categoria leyes_y_reglamentos: la Ley (0) antes que su Reglamento
+    (1), y ambos antes que el resto de normas de la categoria (2). En otras categorias es neutro
+    (0), asi no altera el orden inter-categorias (ese lo fija ORDEN_AUTORIDAD)."""
+    if fila.get("categoria") != "leyes_y_reglamentos":
+        return 0
+    doc = fila.get("documento")
+    if _es_doc_ley_general(doc):
+        return 0
+    if _es_doc_reglamento(doc):
+        return 1
+    return 2
+
+
+def _clave_articulo(fila):
+    """Clave para FUNDIR las partes de un mismo articulo/numeral del mismo documento. None si no
+    aplica (no se funden opiniones, considerandos, secciones, anexos: cada uno es su propia cita)."""
+    if fila.get("tipo_referencia") in ("articulo", "numeral") and fila.get("referencia"):
+        return (fila.get("documento"), fila.get("tipo_referencia"), str(fila.get("referencia")))
+    return None
+
+
+def ordenar_y_agrupar_citas(respuesta, filas):
+    """PRESENTACION pura (no toca recuperacion/generacion). Sobre el par (respuesta, filas) ya
+    generado:
+      (1) FUNDE las partes de un mismo articulo (mismo documento+referencia) en UNA sola cita;
+      (2) ORDENA por jerarquia (ORDEN_AUTORIDAD) y, dentro de leyes_y_reglamentos, la Ley antes
+          que su Reglamento (sub-orden por slug); estable por aparicion como ultimo desempate;
+      (3) RENUMERA los marcadores [N] del cuerpo —incluidos los AGRUPADOS [a, b, c]— para que
+          cada uno siga apuntando a su cita; si dos fuentes se funden, sus marcadores apuntan a
+          la cita unificada; se deduplican numeros repetidos dentro de un mismo marcador.
+    Devuelve (respuesta_renumerada, grupos), donde cada grupo es la lista de filas (partes) de
+    una cita en orden de 'parte'. El numero de la cita N = su posicion (1-based) en `grupos`."""
     if not filas:
-        return respuesta, filas
+        return respuesta, []
+
+    # (1) Agrupar las partes del mismo articulo; conservar el primer indice de aparicion.
+    grupos, idx_de_clave = [], {}
+    for i, f in enumerate(filas):
+        clave = _clave_articulo(f)
+        if clave is not None and clave in idx_de_clave:
+            grupos[idx_de_clave[clave]]["partes"].append((i, f))
+        else:
+            if clave is not None:
+                idx_de_clave[clave] = len(grupos)
+            grupos.append({"partes": [(i, f)], "primer": i, "f0": f})
+
+    # (2) Ordenar grupos: jerarquia de categoria -> Ley/Reglamento -> aparicion (estable).
     rank = {c: i for i, c in enumerate(ORDEN_AUTORIDAD)}
     desconocida = len(ORDEN_AUTORIDAD)
-    orden = sorted(range(len(filas)),
-                   key=lambda j: (rank.get(filas[j].get("categoria"), desconocida), j))
-    # mapa marcador viejo (1-based, orden de generacion) -> nuevo (1-based, orden jerarquico).
-    nuevo_de_viejo = {viejo + 1: nuevo + 1 for nuevo, viejo in enumerate(orden)}
-    filas_ord = [filas[j] for j in orden]
+    grupos.sort(key=lambda g: (rank.get(g["f0"].get("categoria"), desconocida),
+                               _sub_orden_norma(g["f0"]), g["primer"]))
+    for g in grupos:                                   # partes en orden de lectura
+        g["partes"].sort(key=lambda t: (t[1].get("parte") or 1))
+
+    # (3) Mapa marcador viejo (1-based en `filas`) -> nuevo (numero de cita) y renumerado.
+    nuevo_de_viejo = {}
+    for nuevo, g in enumerate(grupos, start=1):
+        for (i, _f) in g["partes"]:
+            nuevo_de_viejo[i + 1] = nuevo
 
     def _remap(m):
-        # Sub en UNA pasada por el valor ORIGINAL: no hay doble-remapeo. Los [N] fuera de
-        # rango ya fueron neutralizados por verificar_citas, asi que todo [N] esta en el mapa.
-        return f"[{nuevo_de_viejo.get(int(m.group(1)), m.group(1))}]"
+        # Renumera CADA numero del marcador (incl. agrupados) por su valor ORIGINAL (sin
+        # doble-remapeo) y deduplica los que caen en la misma cita (ej. dos partes fundidas).
+        vistos, salida = set(), []
+        for n in re.findall(r"\d+", m.group(0)):
+            nn = nuevo_de_viejo.get(int(n), int(n))
+            if nn not in vistos:
+                vistos.add(nn)
+                salida.append(str(nn))
+        return "[" + ", ".join(salida) + "]"
 
-    return _RE_MARCADOR_CITA.sub(_remap, respuesta or ""), filas_ord
+    resp2 = _RE_GRUPO_CITA.sub(_remap, respuesta or "")
+    grupos_filas = [[f for (_i, f) in g["partes"]] for g in grupos]
+    return resp2, grupos_filas
+
+
+def unir_partes(textos):
+    """Concatena las partes (en orden) de un articulo en un texto continuo, REMOVIENDO el solape
+    que el chunker introduce entre partes consecutivas (overlap para recall). Si no halla solape
+    exacto, une con un espacio (defensivo). Solo presentacion."""
+    textos = [t or "" for t in textos]
+    if not textos:
+        return ""
+    full = textos[0]
+    for t in textos[1:]:
+        if not t:
+            continue
+        tope = min(len(full), len(t), 600)
+        ov = 0
+        for k in range(tope, 10, -1):
+            if full[-k:] == t[:k]:
+                ov = k
+                break
+        full = full + t[ov:] if ov else full + " " + t
+    return full
 
 
 def texto_legible(texto):

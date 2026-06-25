@@ -66,7 +66,7 @@ from responder import (
     con_reintentos, doc_label, listar_normas, formato_cita,
     generar_respuesta,   # generacion UNIFICADA (prompt+system identicos en endpoint/CLI/eval)
     nombre_derivado, doc_id_de,   # capa de presentacion: nombre legible/editable por documento
-    reordenar_citas_por_autoridad, texto_legible,   # presentacion: orden por jerarquia + display
+    ordenar_y_agrupar_citas, texto_legible, unir_partes,   # presentacion: orden+agrupacion+display
 )
 # Motores de extraccion (en memoria): PDF+OCR, DOCX, Excel/CSV->Markdown, imagen->OCR.
 from extraccion_texto import (
@@ -780,17 +780,21 @@ def fijar_nombre_override(documento_id, nombre):
             con.close()
 
 
-def _fuentes_normativas(filas):
-    # 'numero' = orden 1-based, coincide con [Fragmento N] de construir_contexto y con
-    # los marcadores [N] que el modelo coloca en la respuesta.
+def _fuentes_normativas(grupos):
+    # `grupos`: lista de citas (ordenadas + agrupadas por ordenar_y_agrupar_citas); cada cita es
+    # una lista de filas = las PARTES de un mismo articulo en orden (o una sola fila). 'numero' =
+    # posicion 1-based, coincide con los marcadores [N] YA renumerados en la respuesta.
     # Se guarda el IDENTIFICADOR (documento_id + slug + categoria) ademas del nombre resuelto,
     # para que las citas se re-resuelvan POR ID al recargar y un renombrado se propague.
-    ids = [doc_id_de(f["documento"], f.get("chunk_id")) for f in filas]
+    ids = [doc_id_de(g[0]["documento"], g[0].get("chunk_id")) for g in grupos]
     cache = _overrides_nombre(ids)
     out = []
-    for i, f in enumerate(filas, start=1):
+    for i, partes in enumerate(grupos, start=1):
+        f = partes[0]                                                 # parte 1 = cabecera del articulo
         did = doc_id_de(f["documento"], f.get("chunk_id"))
         nombre = resolver_nombre(did, f["documento"], f.get("categoria"), _cache=cache)
+        texto_completo = unir_partes([p["texto"] for p in partes])    # articulo entero (sin solape)
+        dists = [1 - p["distance"] for p in partes if p.get("distance") is not None]
         out.append({
             "numero": i,
             "documento": nombre,                                      # nombre a mostrar (resuelto)
@@ -802,10 +806,10 @@ def _fuentes_normativas(filas):
             "referencia": f.get("referencia"),
             "fase": f.get("fase"),
             "emisor": f.get("emisor"),
-            "texto": texto_legible(f["texto"]),                       # texto del fragmento, normalizado SOLO para mostrar
+            "texto": texto_legible(texto_completo),                   # articulo completo, normalizado SOLO para mostrar
             "articulo_num": f["articulo_num"],
             "articulo_titulo": f["articulo_titulo"],
-            "relevancia": round(1 - f["distance"], 3),
+            "relevancia": round(max(dists), 3) if dists else None,    # mejor relevancia entre las partes
         })
     return out
 
@@ -1317,10 +1321,10 @@ def chat(m: Mensaje):
         except Exception as e:
             return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
-        # PRESENTACION: ordena las fuentes por jerarquia (ORDEN_AUTORIDAD) y renumera los [N]
-        # del cuerpo de forma consistente. No toca recuperacion/generacion.
-        respuesta, filas = reordenar_citas_por_autoridad(res["respuesta"], filas)
-        fuentes_norm = _fuentes_normativas(filas)
+        # PRESENTACION: agrupa partes del mismo articulo en una cita, ordena por jerarquia
+        # (Ley antes que Reglamento) y renumera los [N] del cuerpo de forma consistente.
+        respuesta, grupos = ordenar_y_agrupar_citas(res["respuesta"], filas)
+        fuentes_norm = _fuentes_normativas(grupos)
         # PERSISTENCIA (Consulta General = conversacion con caso_id NULL). Misma maquinaria
         # que los casos: crea/usa la conversacion general y guarda ambos turnos.
         conv_id = m.conversacion_id if conversacion_de_caso(m.conversacion_id, None) else ""
@@ -1371,10 +1375,10 @@ def chat(m: Mensaje):
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
-    # PRESENTACION: ordena las fuentes citadas por jerarquia (ORDEN_AUTORIDAD) y renumera los
-    # [N] del cuerpo de forma consistente. No toca recuperacion/generacion.
-    respuesta, filas = reordenar_citas_por_autoridad(res["respuesta"], filas)
-    fuentes_norm = _fuentes_normativas(filas)
+    # PRESENTACION: agrupa partes del mismo articulo en una cita, ordena por jerarquia (Ley
+    # antes que Reglamento) y renumera los [N] del cuerpo de forma consistente.
+    respuesta, grupos = ordenar_y_agrupar_citas(res["respuesta"], filas)
+    fuentes_norm = _fuentes_normativas(grupos)
     fuentes_usadas = [{"id": f["id"], "nombre": f["nombre"]} for f in activos]
 
     # PERSISTENCIA: la conversacion vive en SQLite, ligada al caso. Si no llega
@@ -2580,12 +2584,22 @@ async function enviar(){
 function pintarRespuestaBot(respuesta, fragmentos, fuentesUsadas){
   _msgSeq++;
   const _frags = fragmentos || [];
-  let h = esc(respuesta || 'Sin respuesta.');
+  // Indexa las fuentes por su numero para resolver cada marcador (incl. los agrupados).
+  const cidDe = {};
   _frags.forEach(fr => {
     if(fr.numero == null) return;
-    const cid = _msgSeq + '_' + fr.numero; _citas[cid] = fr;
-    const badge = '<button type="button" class="cita-badge" data-cid="'+cid+'" title="Ver fuente">'+fr.numero+'</button>';
-    h = h.split('['+fr.numero+']').join(badge);
+    const cid = _msgSeq + '_' + fr.numero; _citas[cid] = fr; cidDe[fr.numero] = cid;
+  });
+  let h = esc(respuesta || 'Sin respuesta.');
+  // Marcadores sueltos "[2]" y AGRUPADOS "[2, 5, 6]": cada numero -> su propio badge clicable.
+  h = h.replace(/\[\s*\d+(?:\s*,\s*\d+)*\s*\]/g, grupo => {
+    const nums = grupo.match(/\d+/g) || [];
+    return nums.map(n => {
+      const cid = cidDe[n];
+      return cid
+        ? '<button type="button" class="cita-badge" data-cid="'+cid+'" title="Ver fuente">'+n+'</button>'
+        : '['+n+']';            // numero sin fuente conocida: se deja como texto
+    }).join(' ');
   });
   if(fuentesUsadas && fuentesUsadas.length){
     h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes del caso usadas:</b> '

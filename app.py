@@ -66,6 +66,7 @@ from responder import (
     con_reintentos, doc_label, listar_normas, formato_cita,
     generar_respuesta,   # generacion UNIFICADA (prompt+system identicos en endpoint/CLI/eval)
     nombre_derivado, doc_id_de,   # capa de presentacion: nombre legible/editable por documento
+    reordenar_citas_por_autoridad, texto_legible,   # presentacion: orden por jerarquia + display
 )
 # Motores de extraccion (en memoria): PDF+OCR, DOCX, Excel/CSV->Markdown, imagen->OCR.
 from extraccion_texto import (
@@ -801,7 +802,7 @@ def _fuentes_normativas(filas):
             "referencia": f.get("referencia"),
             "fase": f.get("fase"),
             "emisor": f.get("emisor"),
-            "texto": f["texto"],                                      # texto TEXTUAL del fragmento
+            "texto": texto_legible(f["texto"]),                       # texto del fragmento, normalizado SOLO para mostrar
             "articulo_num": f["articulo_num"],
             "articulo_titulo": f["articulo_titulo"],
             "relevancia": round(1 - f["distance"], 3),
@@ -1316,15 +1317,18 @@ def chat(m: Mensaje):
         except Exception as e:
             return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
+        # PRESENTACION: ordena las fuentes por jerarquia (ORDEN_AUTORIDAD) y renumera los [N]
+        # del cuerpo de forma consistente. No toca recuperacion/generacion.
+        respuesta, filas = reordenar_citas_por_autoridad(res["respuesta"], filas)
         fuentes_norm = _fuentes_normativas(filas)
         # PERSISTENCIA (Consulta General = conversacion con caso_id NULL). Misma maquinaria
         # que los casos: crea/usa la conversacion general y guarda ambos turnos.
         conv_id = m.conversacion_id if conversacion_de_caso(m.conversacion_id, None) else ""
         if not conv_id:
             conv_id = crear_conversacion(None, pregunta)
-        guardar_intercambio(conv_id, pregunta, res["respuesta"], fuentes_norm, [])
+        guardar_intercambio(conv_id, pregunta, respuesta, fuentes_norm, [])
         return {
-            "respuesta": res["respuesta"],
+            "respuesta": respuesta,
             "modo": "general",
             "fuentes_usadas": [],
             "fuentes_normativas": fuentes_norm,
@@ -1367,6 +1371,9 @@ def chat(m: Mensaje):
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
+    # PRESENTACION: ordena las fuentes citadas por jerarquia (ORDEN_AUTORIDAD) y renumera los
+    # [N] del cuerpo de forma consistente. No toca recuperacion/generacion.
+    respuesta, filas = reordenar_citas_por_autoridad(res["respuesta"], filas)
     fuentes_norm = _fuentes_normativas(filas)
     fuentes_usadas = [{"id": f["id"], "nombre": f["nombre"]} for f in activos]
 
@@ -1376,10 +1383,10 @@ def chat(m: Mensaje):
     conv_id = m.conversacion_id if conversacion_de_caso(m.conversacion_id, m.caso_id) else ""
     if not conv_id:
         conv_id = crear_conversacion(m.caso_id, pregunta or "Análisis de fuentes")
-    guardar_intercambio(conv_id, pregunta, res["respuesta"], fuentes_norm, fuentes_usadas)
+    guardar_intercambio(conv_id, pregunta, respuesta, fuentes_norm, fuentes_usadas)
 
     return {
-        "respuesta": res["respuesta"],
+        "respuesta": respuesta,
         "modo": m.modo,
         "fuentes_usadas": fuentes_usadas,
         "fuentes_normativas": fuentes_norm,

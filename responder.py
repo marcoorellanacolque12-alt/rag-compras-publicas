@@ -725,6 +725,64 @@ def construir_contexto(filas):
     return "\n\n".join(bloques)
 
 
+# ======================= ORDEN Y FORMATO DE CITAS (presentacion) =======================
+# DOS transformaciones de PRESENTACION sobre el par (respuesta, filas) YA generado. NO tocan
+# recuperacion, ranking, generacion, embeddings ni el contenido en BigQuery: solo cambian el
+# ORDEN en que se listan las fuentes citadas y el FORMATO del texto de la cita al mostrarlo.
+_RE_MARCADOR_CITA = re.compile(r"\[(\d+)\]")
+
+
+def reordenar_citas_por_autoridad(respuesta, filas):
+    """Reordena las fuentes citadas por JERARQUIA (ORDEN_AUTORIDAD) en vez de por orden de
+    aparicion/relevancia, y RENUMERA de forma consistente los marcadores [N] del cuerpo para
+    que cada [N] siga apuntando a SU fuente en la lista reordenada. Orden estable dentro de la
+    misma categoria (orden original de aparicion como desempate, que ademas conserva contiguas
+    las partes de un mismo articulo). Reusa ORDEN_AUTORIDAD (el mismo orden del ranking de
+    autoridad; no se define un orden nuevo). Devuelve (respuesta_renumerada, filas_reordenadas).
+    PRESENTACION pura: opera sobre lo ya recuperado/generado."""
+    if not filas:
+        return respuesta, filas
+    rank = {c: i for i, c in enumerate(ORDEN_AUTORIDAD)}
+    desconocida = len(ORDEN_AUTORIDAD)
+    orden = sorted(range(len(filas)),
+                   key=lambda j: (rank.get(filas[j].get("categoria"), desconocida), j))
+    # mapa marcador viejo (1-based, orden de generacion) -> nuevo (1-based, orden jerarquico).
+    nuevo_de_viejo = {viejo + 1: nuevo + 1 for nuevo, viejo in enumerate(orden)}
+    filas_ord = [filas[j] for j in orden]
+
+    def _remap(m):
+        # Sub en UNA pasada por el valor ORIGINAL: no hay doble-remapeo. Los [N] fuera de
+        # rango ya fueron neutralizados por verificar_citas, asi que todo [N] esta en el mapa.
+        return f"[{nuevo_de_viejo.get(int(m.group(1)), m.group(1))}]"
+
+    return _RE_MARCADOR_CITA.sub(_remap, respuesta or ""), filas_ord
+
+
+def texto_legible(texto):
+    """Normaliza el texto de un fragmento SOLO para mostrarlo (capa de display): une el
+    word-wrap del PDF (salto de linea simple a media frase -> espacio), repara el guion de fin
+    de linea (de-hifenado, mismo criterio que el chunker) y colapsa espacios, CONSERVANDO los
+    saltos de PARRAFO reales (linea en blanco o fin de oracion). NO se indexa ni se envia al
+    modelo y NO toca el chunk almacenado.
+    Caso (b): un espacio metido DENTRO de una palabra sin guion ('config urarse', una 'l'
+    suelta) es un defecto de extraccion ya horneado en el chunk; NO se corrige aqui porque
+    adivinar la union es riesgoso en texto legal (ver reporte)."""
+    if not texto:
+        return texto
+    t = texto.replace("\r\n", "\n")
+    # de-hifenado: palabra cortada por guion + salto de linea ("contrata-\nción" -> "contratación").
+    t = re.sub(r'(?<=[A-Za-zÁÉÍÓÚÑáéíóúñ])[\-­]\n[ \t]*(?=[A-Za-zÁÉÍÓÚÑáéíóúñ])', '', t)
+    # protege los saltos de PARRAFO reales antes de aplanar el word-wrap.
+    PAR = "\x00"
+    t = re.sub(r'\n[ \t]*\n', PAR, t)                  # linea en blanco = parrafo
+    t = re.sub(r'(?<=[\.\;\:\?\!])\n', PAR, t)          # fin de oracion + salto = parrafo
+    t = t.replace("\n", " ")                            # word-wrap restante -> espacio
+    t = t.replace(PAR, "\n\n")                          # restaura parrafos
+    t = re.sub(r'[ \t]+', ' ', t)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    return t.strip()
+
+
 # ===================================================================
 # GENERACION UNIFICADA — fuente unica compartida por el endpoint (/api/chat),
 # el CLI (responder()) y el harness (eval/). Movida desde app.py para que el

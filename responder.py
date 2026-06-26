@@ -50,6 +50,13 @@ MODELO_EXPANSION = "gemini-2.5-flash"   # reformulacion de consulta (rapido/bara
 
 TOP_K = 10                        # fragmentos a recuperar (configurable; antes 5)
 
+# OVER-FETCH: cuantos candidatos trae la busqueda vectorial ANTES del re-rank por autoridad
+# (_score_autoridad). Se recuperan POOL_OVERFETCH, se re-rankean por jerarquia y se trunca al
+# TOP_K final que va al modelo. Asi una norma de alta autoridad (Ley/Reglamento) que cae en la
+# banda 11..POOL_OVERFETCH por distancia ya no se pierde por el truncado a 10 previo al re-rank.
+# El nº de chunks que ve el LLM sigue siendo TOP_K; esto solo amplia el pool intermedio.
+POOL_OVERFETCH = 30               # tamaño del pool de candidatos (ajustable en un solo lugar)
+
 # Mejora de recuperacion (todo configurable):
 EXPANDIR_CONSULTA = True          # reformula/expande la consulta (tema + sinonimos)
 COMPLETAR_ARTICULO = True         # trae todas las partes del mismo articulo/numeral
@@ -447,9 +454,13 @@ def recuperar(consulta, k=TOP_K, filtros=None, completar=COMPLETAR_ARTICULO):
     if not consultas:
         return []
 
+    # OVER-FETCH: se trae un pool mas amplio (POOL_OVERFETCH) por consulta y se re-rankea por
+    # autoridad ANTES de truncar al top-k final. Asi el re-rank actua sobre todos los candidatos
+    # de la banda 11..POOL_OVERFETCH, no solo sobre los 10 mas cercanos por distancia.
+    n_pool = max(k, POOL_OVERFETCH)
     fusion = {}
     for c in consultas:
-        for f in _buscar(c, k, filtros):
+        for f in _buscar(c, n_pool, filtros):
             cid = f["chunk_id"]
             if cid not in fusion or f["distance"] < fusion[cid]["distance"]:
                 fusion[cid] = f
@@ -465,16 +476,34 @@ try:                                   # apaga el "thinking" del flash si esta d
 except Exception:
     _THINK_OFF = None
 
-_RE_ESPECIFICA = re.compile(
-    r'\b(art|articulo|art[ií]culo|numeral|inciso|ley|reglamento|opini[oó]n|directiva|'
-    r'decreto|constituci[oó]n|tuo|c[oó]digo)\b', re.IGNORECASE)
+# Una consulta es "especifica" (no necesita expansion) si CITA una referencia normativa
+# CONCRETA: una palabra de referencia SEGUIDA de su numero/identificador. Ojo: ni un digito
+# suelto ("13 supuestos") ni una palabra-norma generica suelta ("decreto de contrataciones")
+# bastan -> esas son consultas vagas legitimas que SI deben expandirse.
+_RE_REF_NUMERO = re.compile(
+    r'\b(?:'
+    r'arts?|art[ií]culos?|numeral(?:es)?|inciso|literal|'              # partes de una norma
+    r'ley(?:es)?|reglamento|decretos?(?:\s+(?:supremos?|legislativos?))?|' # tipos de norma
+    r'd\.?\s?s\.?|d\.?\s?l\.?|tuo|c[oó]digo|constituci[oó]n|'          # abreviaturas/codigos
+    r'opini[oó]n|directiva|resoluci[oó]n'                             # otros instrumentos
+    r')'
+    r'\s*(?:n[°ºo]?\.?\s*)?'        # opcional "N°" / "No." entre la palabra y el numero
+    r'\.?\s*\d',                    # DEBE ir seguida (adyacente) de un digito
+    re.IGNORECASE)
+
+# Caso aparte: incisos/literales se citan por LETRA ("inciso a", "literal b)").
+_RE_REF_LETRA = re.compile(r'\b(?:inciso|literal)\s+[a-z]\b', re.IGNORECASE)
 
 
 def _es_especifica(pregunta):
-    """True si la consulta ya es concreta/autocontenida (numero de art., norma citada o
-    suficientes terminos de contenido): sin historial, no necesita expansion."""
+    """True si la consulta ya es concreta/autocontenida y NO necesita expansion. Lo es cuando:
+      - cita una referencia normativa con su numero ("articulo 55", "ley 32069", "DS 009-2025"),
+      - cita un inciso/literal por su letra ("inciso a"), o
+      - es larga y detallada (>=6 palabras de contenido).
+    NO la disparan un digito suelto ("13 supuestos") ni una palabra-norma generica sin numero
+    ("decreto de contrataciones"): esas son consultas vagas que SI se benefician de la expansion."""
     p = pregunta or ""
-    if any(ch.isdigit() for ch in p) or _RE_ESPECIFICA.search(p):
+    if _RE_REF_NUMERO.search(p) or _RE_REF_LETRA.search(p):
         return True
     return len([w for w in re.findall(r'\w+', p) if len(w) > 3]) >= 6
 

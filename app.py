@@ -1322,8 +1322,9 @@ def chat(m: Mensaje):
             return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
         # PRESENTACION: agrupa partes del mismo articulo en una cita, ordena por jerarquia
-        # (Ley antes que Reglamento) y renumera los [N] del cuerpo de forma consistente.
-        respuesta, grupos = ordenar_y_agrupar_citas(res["respuesta"], filas)
+        # (Ley antes que Reglamento), FILTRA las fuentes que el texto no cita (citas_validas) y
+        # renumera los [N] del cuerpo de forma consistente.
+        respuesta, grupos = ordenar_y_agrupar_citas(res["respuesta"], filas, res["citas_validas"])
         fuentes_norm = _fuentes_normativas(grupos)
         # PERSISTENCIA (Consulta General = conversacion con caso_id NULL). Misma maquinaria
         # que los casos: crea/usa la conversacion general y guarda ambos turnos.
@@ -1376,8 +1377,9 @@ def chat(m: Mensaje):
         return JSONResponse(status_code=503, content={"error": _mensaje_error_llm(e)})
 
     # PRESENTACION: agrupa partes del mismo articulo en una cita, ordena por jerarquia (Ley
-    # antes que Reglamento) y renumera los [N] del cuerpo de forma consistente.
-    respuesta, grupos = ordenar_y_agrupar_citas(res["respuesta"], filas)
+    # antes que Reglamento), FILTRA las fuentes que el texto no cita (citas_validas) y renumera
+    # los [N] del cuerpo de forma consistente.
+    respuesta, grupos = ordenar_y_agrupar_citas(res["respuesta"], filas, res["citas_validas"])
     fuentes_norm = _fuentes_normativas(grupos)
     fuentes_usadas = [{"id": f["id"], "nombre": f["nombre"]} for f in activos]
 

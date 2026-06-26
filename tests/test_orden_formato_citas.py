@@ -102,6 +102,67 @@ class TestOrdenYAgrupar(unittest.TestCase):
         self.assertEqual([g[0]["categoria"] for g in grupos],
                          ["opiniones", "resoluciones_tribunal", "documentos_orientacion"])
 
+    # ===== FILTRO DE CITAS FANTASMA (citas_validas) =====
+    def test_filtra_no_citadas_y_conserva_citadas(self):
+        # R101(1) L55p1(2) L55p2(3) R102(4) O1(5); el texto solo usa [1] y [2].
+        filas = [_f("leyes_y_reglamentos", REG, "articulo", "101", tag="R101"),
+                 _f("leyes_y_reglamentos", LEY, "articulo", "55", parte=1, tag="L55a"),
+                 _f("leyes_y_reglamentos", LEY, "articulo", "55", parte=2, tag="L55b"),
+                 _f("leyes_y_reglamentos", REG, "articulo", "102", tag="R102"),
+                 _f("opiniones", "op-d017", "opinion", "D017", tag="O1")]
+        resp = "a [1] b [2]"
+        resp2, grupos = R.ordenar_y_agrupar_citas(resp, filas, {1, 2})
+        # sobreviven solo L55 (idx 2 citado) y R101 (idx 1 citado); R102(4) y O1(5) se eliminan.
+        self.assertEqual([g[0]["tag"] for g in grupos], ["L55a", "R101"])
+        self.assertEqual(len(grupos[0]), 2)                # Art.55 conserva sus 2 partes
+        # renumeracion contigua: orig[1]=R101->2, orig[2]=L55->1
+        self.assertEqual(resp2, "a [2] b [1]")
+
+    def test_numeracion_contigua_sin_huecos(self):
+        # 4 opiniones distintas; el texto usa [1],[3],[4] (NO [2]).
+        filas = [_f("opiniones", "op-1", "opinion", "A", tag="O1"),
+                 _f("opiniones", "op-2", "opinion", "B", tag="O2"),
+                 _f("opiniones", "op-3", "opinion", "C", tag="O3"),
+                 _f("opiniones", "op-4", "opinion", "D", tag="O4")]
+        resp = "[1] [3] [4]"
+        resp2, grupos = R.ordenar_y_agrupar_citas(resp, filas, {1, 3, 4})
+        self.assertEqual([g[0]["tag"] for g in grupos], ["O1", "O3", "O4"])   # O2 eliminada
+        nums = sorted(int(x) for x in _RE_MARCA.findall(resp2))
+        self.assertEqual(nums, [1, 2, 3])                  # contiguo, sin saltos ni [4]
+        self.assertEqual(resp2, "[1] [2] [3]")
+
+    def test_articulo_2_partes_citado_por_una_se_conserva(self):
+        # se cita solo la parte 1 del Art.55; el grupo (p1+p2) debe conservarse completo.
+        filas = [_f("leyes_y_reglamentos", LEY, "articulo", "55", parte=1, tag="p1"),
+                 _f("leyes_y_reglamentos", LEY, "articulo", "55", parte=2, tag="p2")]
+        resp2, grupos = R.ordenar_y_agrupar_citas("solo [1]", filas, {1})
+        self.assertEqual(len(grupos), 1)
+        self.assertEqual([p["parte"] for p in grupos[0]], [1, 2])
+        self.assertEqual(resp2, "solo [1]")
+
+    def test_ningun_marcador_queda_huerfano(self):
+        # propiedad: todo [N] de la respuesta filtrada apunta a un grupo existente (1..len).
+        filas = [_f("leyes_y_reglamentos", REG, "articulo", "101", tag="R101"),
+                 _f("leyes_y_reglamentos", LEY, "articulo", "55", parte=1, tag="L55a"),
+                 _f("leyes_y_reglamentos", LEY, "articulo", "55", parte=2, tag="L55b"),
+                 _f("opiniones", "op-d017", "opinion", "D017", tag="O1")]
+        resp = "x [1] y [2, 3]"                            # incluye un marcador AGRUPADO
+        resp2, grupos = R.ordenar_y_agrupar_citas(resp, filas, {1, 2, 3})
+        for n in (int(x) for x in _RE_MARCA.findall(resp2)):
+            self.assertTrue(1 <= n <= len(grupos))
+
+    def test_citas_validas_none_no_filtra(self):
+        # compatibilidad: sin citas_validas se listan TODOS los grupos (comportamiento previo).
+        filas = [_f("opiniones", "op-1", "opinion", "A"),
+                 _f("opiniones", "op-2", "opinion", "B")]
+        _, grupos = R.ordenar_y_agrupar_citas("[1]", filas)        # None -> no filtra
+        self.assertEqual(len(grupos), 2)
+
+    def test_citas_validas_vacias_lista_vacia(self):
+        filas = [_f("opiniones", "op-1", "opinion", "A")]
+        self.assertEqual(R.ordenar_y_agrupar_citas("sin marcadores", filas, set()),
+                         ("sin marcadores", []))
+
     def test_lista_vacia(self):
         self.assertEqual(R.ordenar_y_agrupar_citas("sin citas", []), ("sin citas", []))
 

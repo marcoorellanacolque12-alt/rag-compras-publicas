@@ -799,15 +799,19 @@ def _clave_articulo(fila):
     return None
 
 
-def ordenar_y_agrupar_citas(respuesta, filas):
+def ordenar_y_agrupar_citas(respuesta, filas, citas_validas=None):
     """PRESENTACION pura (no toca recuperacion/generacion). Sobre el par (respuesta, filas) ya
     generado:
       (1) FUNDE las partes de un mismo articulo (mismo documento+referencia) en UNA sola cita;
       (2) ORDENA por jerarquia (ORDEN_AUTORIDAD) y, dentro de leyes_y_reglamentos, la Ley antes
           que su Reglamento (sub-orden por slug); estable por aparicion como ultimo desempate;
+      (2b) FILTRA las citas FANTASMA: si se pasa `citas_validas`, descarta los grupos que el
+          texto NO referencia (ningun [N]). Asi la lista de fuentes muestra solo lo citado.
       (3) RENUMERA los marcadores [N] del cuerpo —incluidos los AGRUPADOS [a, b, c]— para que
           cada uno siga apuntando a su cita; si dos fuentes se funden, sus marcadores apuntan a
           la cita unificada; se deduplican numeros repetidos dentro de un mismo marcador.
+    `citas_validas`: conjunto de marcadores [N] (1-based en `filas`) que el texto realmente usa
+    (de verificar_citas). Si es None NO se filtra (compatibilidad: lista todos los grupos).
     Devuelve (respuesta_renumerada, grupos), donde cada grupo es la lista de filas (partes) de
     una cita en orden de 'parte'. El numero de la cita N = su posicion (1-based) en `grupos`."""
     if not filas:
@@ -831,6 +835,18 @@ def ordenar_y_agrupar_citas(respuesta, filas):
                                _sub_orden_norma(g["f0"]), g["primer"]))
     for g in grupos:                                   # partes en orden de lectura
         g["partes"].sort(key=lambda t: (t[1].get("parte") or 1))
+
+    # (2b) FILTRO DE CITAS FANTASMA: conserva un grupo solo si AL MENOS UNA de sus partes esta
+    # citada en el texto (indice 1-based en `filas`, = espacio de `citas_validas`). Como solo se
+    # quitan grupos con CERO partes citadas, ningun [N] del texto queda huerfano. Va ANTES de la
+    # renumeracion (3), que se hace sobre los supervivientes -> numeracion contigua, sin huecos.
+    # citas_validas=None desactiva el filtro (compatibilidad: comportamiento previo, lista todo).
+    if citas_validas is not None:
+        citadas = set(citas_validas)
+        grupos = [g for g in grupos
+                  if any((i + 1) in citadas for (i, _f) in g["partes"])]
+        if not grupos:
+            return respuesta, []
 
     # (3) Mapa marcador viejo (1-based en `filas`) -> nuevo (numero de cita) y renumerado.
     nuevo_de_viejo = {}

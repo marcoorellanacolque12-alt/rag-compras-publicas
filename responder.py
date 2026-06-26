@@ -897,12 +897,44 @@ INSTRUCCION_PRECISION = (
     "informacion SOLO cuando el contexto realmente no la contenga."
 )
 
-# Instruccion de ESTRUCTURA de la respuesta (ADITIVA; el guardrail no se toca).
+# Instruccion de ESTRUCTURA y COMPLETITUD (ADITIVA; el guardrail no se toca). Mejora la calidad
+# de lo que YA esta en el contexto: no autoriza a agregar contenido no recuperado.
 INSTRUCCION_ESTRUCTURA = (
-    "ESTRUCTURA DE LA RESPUESTA: comienza con una apertura DIRECTA de 1-2 frases que responda "
-    "la pregunta. Si hay varias reglas, supuestos o condiciones, desarrollalas despues en "
-    "puntos o numeracion (una idea por punto). Cierra indicando la referencia normativa "
-    "principal que sustenta la respuesta."
+    "ESTRUCTURA Y COMPLETITUD DE LA RESPUESTA:\n"
+    "1. ENCUADRE: abre situando la figura en su marco normativo: nombra la Ley (y su Reglamento) "
+    "que la gobierna antes de entrar al detalle.\n"
+    "2. ENUMERA LO QUE LA NORMA ENUMERA: si una norma del contexto contiene una lista taxativa "
+    "(causales, supuestos, requisitos, excepciones), reproducela COMPLETA. Esta PROHIBIDO "
+    "resumirla como 'supuestos especificos', 'entre otros' o '...': si los items estan en el "
+    "contexto, enuncialos TODOS.\n"
+    "3. LISTAS CON GLOSA: presenta las enumeraciones como lista, cada item con una explicacion "
+    "breve en lenguaje claro; no las amontones en un parrafo denso.\n"
+    "4. QUIEN DECIDE: cuando la norma asigne una competencia o responsable (quien aprueba, quien "
+    "es competente, si la facultad es delegable o indelegable), nombralo de forma explicita.\n"
+    "5. LIMITACIONES Y EXCEPCIONES NOMBRADAS: no las insinues ('con una excepcion', 'salvo "
+    "ciertos casos'); nombra cual es la limitacion y cual la excepcion concretas.\n"
+    "6. CIERRE: indica la referencia normativa principal que sustenta la respuesta.\n"
+    "Ajusta la extension y la estructura a la complejidad de la consulta: no infles una respuesta "
+    "simple con secciones o listas que no aporten. Si un detalle (p.ej. una causal) NO esta en el "
+    "contexto recuperado, no lo inventes: responde con lo que el contexto contiene."
+)
+
+# Instruccion de JERARQUIA al responder (ADITIVA): liderar con la fuente de mayor autoridad.
+INSTRUCCION_JERARQUIA = (
+    "JERARQUIA AL RESPONDER: estructura la respuesta apoyandote PRIMERO en la fuente de mayor "
+    "autoridad presente en el contexto (Ley -> Reglamento -> directivas -> opiniones/resoluciones). "
+    "Las opiniones y resoluciones son APOYO o ACLARACION: NO deben ser la fuente principal cuando "
+    "en el contexto hay Ley o Reglamento aplicable al tema."
+)
+
+# Instruccion de REGISTRO y FORMATO (ADITIVA): tono formal tecnico-legal, negritas, sin emojis.
+INSTRUCCION_REGISTRO = (
+    "REGISTRO Y FORMATO: registro por defecto FORMAL, tecnico-legal, profesional y bien "
+    "estructurado (apto para pegar en un informe). Resalta con NEGRITAS de markdown (**...**) las "
+    "ideas fuerza (nombres de causales, terminos clave como 'facultad indelegable' o 'prohibida la "
+    "regularizacion'), con criterio y no en todo el texto. NO uses emojis. Solo si el usuario pide "
+    "de forma expresa un tono didactico o dinamico puedes aligerar el lenguaje, pero aun asi SIN "
+    "emojis salvo que el usuario los pida explicitamente."
 )
 
 # Instruccion de CRUCE Ley<->Reglamento ANCLADO al contexto (ADITIVA).
@@ -960,9 +992,11 @@ def _ensamblar_prompt(pregunta, filas, modo, contexto_fuentes, etiquetas):
             "CONTEXTO NORMATIVO PROPORCIONADO (unica fuente de verdad):\n"
             + contexto_normas + "\n\n"
             + INSTRUCCION_PRECISION + "\n\n"
+            + INSTRUCCION_JERARQUIA + "\n\n"
             + INSTRUCCION_ESTRUCTURA + "\n\n"
             + INSTRUCCION_CRUCE + "\n\n"
             + INSTRUCCION_CITAS + "\n\n"
+            + INSTRUCCION_REGISTRO + "\n\n"
             "CONSULTA DEL USUARIO:\n" + pregunta
         )
         return _sistema_consulta_general(), prompt
@@ -985,9 +1019,11 @@ def _ensamblar_prompt(pregunta, filas, modo, contexto_fuentes, etiquetas):
         secciones.append(f"CONSULTA DEL USUARIO:\n{pregunta or '(resume y comenta las fuentes activas)'}")
 
     secciones.append(INSTRUCCION_PRECISION)
+    secciones.append(INSTRUCCION_JERARQUIA)
     secciones.append(INSTRUCCION_ESTRUCTURA)
     secciones.append(INSTRUCCION_CRUCE)
     secciones.append(INSTRUCCION_CITAS)
+    secciones.append(INSTRUCCION_REGISTRO)
     return sistema, "\n\n".join(secciones)
 
 

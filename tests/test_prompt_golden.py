@@ -38,10 +38,37 @@ G_PRECISION = (
     "informacion SOLO cuando el contexto realmente no la contenga."
 )
 G_ESTRUCTURA = (
-    "ESTRUCTURA DE LA RESPUESTA: comienza con una apertura DIRECTA de 1-2 frases que responda "
-    "la pregunta. Si hay varias reglas, supuestos o condiciones, desarrollalas despues en "
-    "puntos o numeracion (una idea por punto). Cierra indicando la referencia normativa "
-    "principal que sustenta la respuesta."
+    "ESTRUCTURA Y COMPLETITUD DE LA RESPUESTA:\n"
+    "1. ENCUADRE: abre situando la figura en su marco normativo: nombra la Ley (y su Reglamento) "
+    "que la gobierna antes de entrar al detalle.\n"
+    "2. ENUMERA LO QUE LA NORMA ENUMERA: si una norma del contexto contiene una lista taxativa "
+    "(causales, supuestos, requisitos, excepciones), reproducela COMPLETA. Esta PROHIBIDO "
+    "resumirla como 'supuestos especificos', 'entre otros' o '...': si los items estan en el "
+    "contexto, enuncialos TODOS.\n"
+    "3. LISTAS CON GLOSA: presenta las enumeraciones como lista, cada item con una explicacion "
+    "breve en lenguaje claro; no las amontones en un parrafo denso.\n"
+    "4. QUIEN DECIDE: cuando la norma asigne una competencia o responsable (quien aprueba, quien "
+    "es competente, si la facultad es delegable o indelegable), nombralo de forma explicita.\n"
+    "5. LIMITACIONES Y EXCEPCIONES NOMBRADAS: no las insinues ('con una excepcion', 'salvo "
+    "ciertos casos'); nombra cual es la limitacion y cual la excepcion concretas.\n"
+    "6. CIERRE: indica la referencia normativa principal que sustenta la respuesta.\n"
+    "Ajusta la extension y la estructura a la complejidad de la consulta: no infles una respuesta "
+    "simple con secciones o listas que no aporten. Si un detalle (p.ej. una causal) NO esta en el "
+    "contexto recuperado, no lo inventes: responde con lo que el contexto contiene."
+)
+G_JERARQUIA = (
+    "JERARQUIA AL RESPONDER: estructura la respuesta apoyandote PRIMERO en la fuente de mayor "
+    "autoridad presente en el contexto (Ley -> Reglamento -> directivas -> opiniones/resoluciones). "
+    "Las opiniones y resoluciones son APOYO o ACLARACION: NO deben ser la fuente principal cuando "
+    "en el contexto hay Ley o Reglamento aplicable al tema."
+)
+G_REGISTRO = (
+    "REGISTRO Y FORMATO: registro por defecto FORMAL, tecnico-legal, profesional y bien "
+    "estructurado (apto para pegar en un informe). Resalta con NEGRITAS de markdown (**...**) las "
+    "ideas fuerza (nombres de causales, terminos clave como 'facultad indelegable' o 'prohibida la "
+    "regularizacion'), con criterio y no en todo el texto. NO uses emojis. Solo si el usuario pide "
+    "de forma expresa un tono didactico o dinamico puedes aligerar el lenguaje, pero aun asi SIN "
+    "emojis salvo que el usuario los pida explicitamente."
 )
 G_CRUCE = (
     "CRUCE LEY-REGLAMENTO (OBLIGATORIO): revisa TODOS los fragmentos del contexto. Si ademas "
@@ -83,6 +110,8 @@ class TestPromptGolden(unittest.TestCase):
         self.assertEqual(R.INSTRUCCION_CITAS, G_CITAS)
         self.assertEqual(R.INSTRUCCION_PRECISION, G_PRECISION)
         self.assertEqual(R.INSTRUCCION_ESTRUCTURA, G_ESTRUCTURA)
+        self.assertEqual(R.INSTRUCCION_JERARQUIA, G_JERARQUIA)
+        self.assertEqual(R.INSTRUCCION_REGISTRO, G_REGISTRO)
         self.assertEqual(R.INSTRUCCION_CRUCE, G_CRUCE)
 
     def test_modo_general(self):
@@ -92,7 +121,8 @@ class TestPromptGolden(unittest.TestCase):
             R.GUARDRAIL_CONSULTA_GENERAL + "\n\n"
             "CONTEXTO NORMATIVO PROPORCIONADO (unica fuente de verdad):\n"
             + self._ctx() + "\n\n"
-            + G_PRECISION + "\n\n" + G_ESTRUCTURA + "\n\n" + G_CRUCE + "\n\n" + G_CITAS + "\n\n"
+            + G_PRECISION + "\n\n" + G_JERARQUIA + "\n\n" + G_ESTRUCTURA + "\n\n"
+            + G_CRUCE + "\n\n" + G_CITAS + "\n\n" + G_REGISTRO + "\n\n"
             "CONSULTA DEL USUARIO:\n" + PREG
         )
         self.assertEqual(prompt, esperado)
@@ -104,7 +134,7 @@ class TestPromptGolden(unittest.TestCase):
             f"NORMAS RECUPERADAS (base vectorial):\n{self._ctx()}",
             "DOCUMENTOS DEL CASO (fuentes activas seleccionadas por el usuario):\n" + CTX_FUENTES,
             f"CONSULTA DEL USUARIO:\n{PREG}",
-            G_PRECISION, G_ESTRUCTURA, G_CRUCE, G_CITAS,
+            G_PRECISION, G_JERARQUIA, G_ESTRUCTURA, G_CRUCE, G_CITAS, G_REGISTRO,
         ])
         self.assertEqual(prompt, esperado)
 
@@ -115,7 +145,7 @@ class TestPromptGolden(unittest.TestCase):
             f"NORMAS RECUPERADAS (base vectorial):\n{self._ctx()}",
             "DOCUMENTOS DEL CASO: (ninguna fuente activa en este turno).",
             "CONSULTA DEL USUARIO:\n(resume y comenta las fuentes activas)",
-            G_PRECISION, G_ESTRUCTURA, G_CRUCE, G_CITAS,
+            G_PRECISION, G_JERARQUIA, G_ESTRUCTURA, G_CRUCE, G_CITAS, G_REGISTRO,
         ])
         self.assertEqual(prompt, esperado)
 
@@ -128,7 +158,7 @@ class TestPromptGolden(unittest.TestCase):
             "DOCUMENTOS DEL CASO (fuentes activas seleccionadas por el usuario):\n" + CTX_FUENTES,
             "TAREA: Realiza la auditoria legal de las fuentes activas segun las "
             "instrucciones del sistema.\nFoco adicional del usuario: " + PREG,
-            G_PRECISION, G_ESTRUCTURA, G_CRUCE, G_CITAS,
+            G_PRECISION, G_JERARQUIA, G_ESTRUCTURA, G_CRUCE, G_CITAS, G_REGISTRO,
         ])
         self.assertEqual(prompt, esperado)
 

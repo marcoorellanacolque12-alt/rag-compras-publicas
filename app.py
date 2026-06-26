@@ -1484,9 +1484,24 @@ HTML = r"""
     border-radius:.35rem; cursor:pointer; vertical-align:.12em; background:rgb(var(--accent) / 0.16);
     color:rgb(var(--accent)); border:1px solid rgb(var(--accent) / 0.45); transition:background .15s; }
   .cita-badge:hover { background:rgb(var(--accent) / 0.30); }
-  .cita-panel { position:fixed; right:1rem; bottom:1rem; width:min(420px, calc(100vw - 2rem));
-    max-height:62vh; overflow-y:auto; background:rgb(var(--c900)); border:1px solid rgb(var(--c700));
-    border-radius:.6rem; box-shadow:0 10px 30px rgb(0 0 0 / .30); z-index:50; }
+  /* Ventana de cita: flotante, MULTIPLE, movible (arrastrando el encabezado) y
+     redimensionable (resize:both, grip abajo-derecha). Encabezado fijo (flex-none) y solo
+     el cuerpo hace scroll -> el boton cerrar siempre queda visible. */
+  .cita-win { position:fixed; width:min(420px, calc(100vw - 2rem)); height:340px;
+    min-width:240px; min-height:150px; max-width:calc(100vw - .5rem); max-height:calc(100vh - .5rem);
+    display:flex; flex-direction:column; resize:both; overflow:hidden;
+    background:rgb(var(--c900)); border:1px solid rgb(var(--c700)); border-radius:.6rem;
+    box-shadow:0 12px 34px rgb(0 0 0 / .38); z-index:50; }
+  .cita-win__head { flex:0 0 auto; cursor:move; user-select:none; display:flex; align-items:center;
+    justify-content:space-between; gap:.5rem; padding:.5rem .7rem; border-bottom:1px solid rgb(var(--c700));
+    background:rgb(var(--c900)); border-radius:.6rem .6rem 0 0; }
+  .cita-win__title { font-size:.72rem; font-weight:700; color:rgb(var(--c100));
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cita-win__close { flex:0 0 auto; cursor:pointer; background:none; border:none; padding:0 .2rem;
+    color:rgb(var(--c500)); font-size:1.2rem; line-height:1; }
+  .cita-win__close:hover { color:rgb(var(--c200)); }
+  .cita-win__body { flex:1 1 auto; overflow-y:auto; padding:.6rem .8rem; }
+  .cita-win__foot { flex:0 0 auto; text-align:right; padding:.3rem .7rem .55rem; }
   .cita-quote { border-left:3px solid rgb(var(--accent)); padding-left:.7rem; white-space:pre-wrap;
     line-height:1.55; color:rgb(var(--c200)); }
   .cita-flash { outline:2px solid rgb(var(--accent)); border-radius:.3rem; transition:outline .3s; }
@@ -1803,22 +1818,8 @@ HTML = r"""
     </div>
   </aside>
 
-  <!-- PANEL DE CITA (estilo NotebookLM): texto textual del fragmento citado -->
-  <div id="citaPanel" class="cita-panel hidden-x">
-    <div class="flex items-start justify-between gap-2 px-4 py-3 border-b border-slate-700">
-      <div class="min-w-0">
-        <div id="citaRef" class="text-xs font-semibold text-slate-100 truncate">—</div>
-        <div id="citaMeta" class="text-[11px] text-slate-500 mt-0.5"></div>
-      </div>
-      <button onclick="cerrarCita()" title="Cerrar" class="flex-none text-slate-500 hover:text-slate-200 text-lg leading-none">&times;</button>
-    </div>
-    <div class="px-4 py-3">
-      <div id="citaTexto" class="cita-quote text-xs"></div>
-      <div class="mt-3 text-right">
-        <button id="citaFuente" onclick="verFuenteCita()" class="text-[11px] text-blue-400 hover:underline">ver fuente →</button>
-      </div>
-    </div>
-  </div>
+  <!-- Las VENTANAS DE CITA se crean dinamicamente en document.body (multiples, movibles,
+       redimensionables) desde abrirCita(); ver el bloque "CITAS: ventanas flotantes". -->
 </div>
 
 <script>
@@ -1832,7 +1833,11 @@ const MAX_HIST_CLIENTE = 40;
 // Citas (estilo NotebookLM): mapa cid -> fragmento, para abrir el texto al clic.
 let _citas = {};
 let _msgSeq = 0;
-let _citaActual = null;
+// Ventanas de cita flotantes (multiples). Estado: z-index incremental (traer al frente),
+// escalonado de aperturas (cascada) y mapa cid -> ventana abierta (evita duplicar).
+let _citaZ = 60;
+let _citaCascada = 0;
+const _citaWins = {};
 
 // ===== ARQUITECTURA MULTITAREA: estado global desacoplado de la vista activa =====
 const seleccion = new Set();   // caso_ids marcados para borrado masivo
@@ -1897,29 +1902,78 @@ function initTema(){
   setTema(modo);
 }
 
-// ===== CITAS desplegables (estilo NotebookLM) =====
-function etiquetaTipo(t){
-  return ({articulo:'Art.', numeral:'Numeral', opinion:'Opinión', considerando:'Considerando',
-           anexo:'Anexo', seccion:'Sección', preambulo:'Preámbulo'})[t] || (t || '');
-}
+// ===== CITAS: ventanas flotantes (multiples, movibles, redimensionables) =====
+function _citaAlFrente(win){ win.style.zIndex = (++_citaZ); }
+
 function abrirCita(cid){
   const fr = _citas[cid]; if(!fr) return;
-  _citaActual = fr;
-  document.getElementById('citaRef').textContent = fr.documento || 'Fuente';
-  const refTxt = fr.tipo_referencia
-      ? (etiquetaTipo(fr.tipo_referencia) + (fr.referencia ? (' ' + fr.referencia) : ''))
-      : (fr.cita || '');
-  document.getElementById('citaMeta').textContent =
-      [refTxt, fr.fase ? ('fase: ' + fr.fase) : '', fr.emisor || ''].filter(Boolean).join('  ·  ');
-  document.getElementById('citaTexto').textContent = fr.texto || '(sin texto del fragmento)';
-  document.getElementById('citaPanel').classList.remove('hidden-x');
+  // Si esa cita ya esta abierta, traerla al frente y resaltar (no duplicar la ventana).
+  if(_citaWins[cid]){ _citaAlFrente(_citaWins[cid]); _citaFlash(_citaWins[cid]); return; }
+
+  const win = document.createElement('div');
+  win.className = 'cita-win';
+  // Posicion inicial: cerca de abajo-derecha, ESCALONADA (cascada) para distinguir varias.
+  const off = (_citaCascada++ % 6) * 26;
+  const w = Math.min(420, window.innerWidth - 32);
+  win.style.left = Math.max(8, window.innerWidth - w - 24 - off) + 'px';
+  win.style.top  = Math.max(12, window.innerHeight - 372 - off) + 'px';
+  win.style.zIndex = (++_citaZ);
+
+  // Encabezado SIMPLIFICADO (H): solo el nombre/identificacion de la fuente + cerrar.
+  // Nada de fase ni emisor.
+  const titulo = fr.cita || fr.documento || 'Fuente';
+  win.innerHTML =
+    '<div class="cita-win__head">' +
+      '<span class="cita-win__title" title="'+esc(titulo)+'">'+esc(titulo)+'</span>' +
+      '<button class="cita-win__close" title="Cerrar" aria-label="Cerrar">&times;</button>' +
+    '</div>' +
+    '<div class="cita-win__body"><div class="cita-quote text-xs"></div></div>' +
+    '<div class="cita-win__foot"><button class="text-[11px] text-blue-400 hover:underline">ver fuente →</button></div>';
+  win.querySelector('.cita-quote').textContent = fr.texto || '(sin texto del fragmento)';
+
+  document.body.appendChild(win);
+  _citaWins[cid] = win;
+
+  _citaAlFrente(win);
+  win.addEventListener('mousedown', () => _citaAlFrente(win));   // clic en la ventana -> al frente
+  win.querySelector('.cita-win__close').addEventListener('click', (e) => {
+    e.stopPropagation(); win.remove(); delete _citaWins[cid];    // cierra SOLO esta ventana
+  });
+  win.querySelector('.cita-win__foot button').addEventListener('click', (e) => {
+    e.stopPropagation(); verFuenteCita(fr);
+  });
+  _citaArrastrable(win, win.querySelector('.cita-win__head'));
 }
-function cerrarCita(){ document.getElementById('citaPanel').classList.add('hidden-x'); }
-function verFuenteCita(){
-  if(!_citaActual) return;
-  togglePanelNormativo(true);                       // asegura visible el panel derecho
+
+function _citaFlash(win){ win.classList.add('cita-flash'); setTimeout(()=>win.classList.remove('cita-flash'), 900); }
+
+// Arrastra `win` tomandolo de `handle` (su encabezado). Clamp al viewport para que no se
+// pierda ni quede inalcanzable.
+function _citaArrastrable(win, handle){
+  let sx=0, sy=0, ox=0, oy=0, drag=false;
+  handle.addEventListener('mousedown', (e) => {
+    if(e.target.closest('.cita-win__close')) return;     // el ✕ no arrastra
+    const r = win.getBoundingClientRect();
+    drag=true; ox=r.left; oy=r.top; sx=e.clientX; sy=e.clientY;
+    document.body.style.userSelect='none'; e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if(!drag) return;
+    const r = win.getBoundingClientRect();
+    let nl = ox + (e.clientX - sx), nt = oy + (e.clientY - sy);
+    nl = Math.max(0, Math.min(nl, window.innerWidth  - r.width));
+    nt = Math.max(0, Math.min(nt, window.innerHeight - r.height));
+    win.style.left = nl + 'px'; win.style.top = nt + 'px';
+  });
+  document.addEventListener('mouseup', () => { if(drag){ drag=false; document.body.style.userSelect=''; } });
+}
+
+// "ver fuente →": salta al panel derecho (Marco normativo) y resalta la norma (igual que antes).
+function verFuenteCita(fr){
+  if(!fr) return;
+  togglePanelNormativo(true);
   const cont = document.getElementById('filtroNormas');
-  const objetivo = (_citaActual.documento || '').trim().toLowerCase();
+  const objetivo = (fr.documento || '').trim().toLowerCase();
   if(cont && objetivo){
     for(const l of cont.querySelectorAll('label')){
       if(l.textContent.trim().toLowerCase().includes(objetivo)){

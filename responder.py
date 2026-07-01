@@ -858,13 +858,20 @@ def ordenar_y_agrupar_citas(respuesta, filas, citas_validas=None):
     def _remap(m):
         # Renumera CADA numero del marcador (incl. agrupados) por su valor ORIGINAL (sin
         # doble-remapeo) y deduplica los que caen en la misma cita (ej. dos partes fundidas).
+        # BACKSTOP (cinturon de seguridad): si un numero viejo NO tiene grupo superviviente en
+        # `nuevo_de_viejo` (su fuente se filtro), se ELIMINA del marcador en vez de dejarlo pasar
+        # tal cual; asi ningun marcador puede quedar huerfano ni apuntar a la fuente equivocada.
+        # Con el arreglo (a) esto casi no deberia dispararse (los citados sobreviven al filtro),
+        # pero blinda cualquier residual. Un marcador que se queda sin numeros validos se quita.
         vistos, salida = set(), []
         for n in re.findall(r"\d+", m.group(0)):
-            nn = nuevo_de_viejo.get(int(n), int(n))
+            nn = nuevo_de_viejo.get(int(n))
+            if nn is None:
+                continue                       # sin grupo superviviente -> se descarta el numero
             if nn not in vistos:
                 vistos.add(nn)
                 salida.append(str(nn))
-        return "[" + ", ".join(salida) + "]"
+        return ("[" + ", ".join(salida) + "]") if salida else ""
 
     resp2 = _RE_GRUPO_CITA.sub(_remap, respuesta or "")
     grupos_filas = [[f for (_i, f) in g["partes"]] for g in grupos]

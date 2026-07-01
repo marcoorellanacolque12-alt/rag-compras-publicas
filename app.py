@@ -65,6 +65,7 @@ from responder import (
     embeber_para_indexar, indexar_chunks, eliminar_por_prefijo,
     con_reintentos, doc_label, listar_normas, formato_cita,
     generar_respuesta,   # generacion UNIFICADA (prompt+system identicos en endpoint/CLI/eval)
+    generar_preguntas_sugeridas,   # llamada corta aislada: preguntas de profundizacion clicables
     nombre_derivado, doc_id_de,   # capa de presentacion: nombre legible/editable por documento
     ordenar_y_agrupar_citas, texto_legible, unir_partes,   # presentacion: orden+agrupacion+display
 )
@@ -1339,6 +1340,7 @@ def chat(m: Mensaje):
             "fuentes_normativas": fuentes_norm,
             "citas_invalidas": res["citas_invalidas"],
             "conversacion_id": conv_id,
+            "sugerencias": generar_preguntas_sugeridas(pregunta, respuesta),
         }
 
     # ===== CHAT / ANALISIS dentro de un caso =====
@@ -1398,6 +1400,7 @@ def chat(m: Mensaje):
         "fuentes_normativas": fuentes_norm,
         "citas_invalidas": res["citas_invalidas"],
         "conversacion_id": conv_id,
+        "sugerencias": generar_preguntas_sugeridas(pregunta, respuesta),
     }
 
 
@@ -1992,6 +1995,54 @@ document.addEventListener('click', function(e){
   if(b && b.dataset.cid) abrirCita(b.dataset.cid);
 });
 
+// Delegacion: una pregunta sugerida (Mejora 3) se escribe en el buscador y se envia
+// reusando el flujo de consulta existente (mismo enviar() de una consulta manual).
+document.addEventListener('click', function(e){
+  const s = e.target.closest('.sugerencia');
+  if(!s) return;
+  const q = document.getElementById('q');
+  if(!q) return;
+  q.value = s.textContent.trim();
+  enviar();
+});
+
+// === Mejora 4: copiar TEXTO PLANO LIMPIO desde una respuesta del bot ===
+// Al copiar, elimina los marcadores de cita [N] y limpia el Markdown literal (negritas/cursivas/
+// vinetas/backticks) que hoy se ve en el texto -> texto plano para pegar en un informe. Solo actua
+// cuando la seleccion esta contenida en una burbuja .msg-bot; fuera de una respuesta NO hace nada
+// (copia normal del navegador).
+function _limpiarMarkdownCopia(t){
+  if(!t) return '';
+  t = t.replace(/\*\*([\s\S]*?)\*\*/g, '$1');                  // negritas **...**
+  t = t.replace(/\*([^*\n]+)\*/g, '$1');                       // cursivas *...*
+  t = t.replace(/`+/g, '');                                    // backticks de codigo
+  t = t.replace(/\[\s*\d+(?:\s*,\s*\d+)*\s*\]/g, '');          // marcadores de cita [N] residuales
+  t = t.replace(/^[ \t]*(?:[*\-•]|\d+[.\)])[ \t]+/gm, '');     // vinetas / numeracion al inicio de linea
+  t = t.replace(/[ \t]{2,}/g, ' ');                            // colapsa espacios dobles (los que dejan los badges)
+  t = t.replace(/[ \t]+([.,;:)\]])/g, '$1');                   // quita el espacio antes de puntuacion
+  t = t.replace(/[ \t]+\n/g, '\n');                            // limpia espacios al final de linea
+  return t.trim();
+}
+document.addEventListener('copy', function(e){
+  const sel = window.getSelection();
+  if(!sel || sel.rangeCount===0 || sel.isCollapsed) return;
+  const rango = sel.getRangeAt(0);
+  let anc = rango.commonAncestorContainer;
+  if(anc.nodeType !== 1) anc = anc.parentElement;
+  if(!anc || !anc.closest('.msg-bot')) return;                 // fuera de una respuesta: copia normal
+  // Trabaja sobre una COPIA del fragmento seleccionado (no toca el DOM real ni la seleccion visible).
+  const cont = document.createElement('div');
+  cont.appendChild(rango.cloneContents());
+  // Quita los pies no-sustantivos por si la seleccion los alcanza.
+  cont.querySelectorAll('.fuentes-citadas, .fuentes-caso, .preguntas-sugeridas').forEach(x=>x.remove());
+  // ELIMINA los marcadores de cita: cada badge inline [N] se quita por completo.
+  cont.querySelectorAll('.cita-badge').forEach(b=> b.remove());
+  const limpio = _limpiarMarkdownCopia(cont.textContent || '');
+  if(!limpio) return;
+  e.clipboardData.setData('text/plain', limpio);
+  e.preventDefault();
+});
+
 async function fetchConTimeout(url, opts, ms){
   const ctrl = new AbortController();
   const t = setTimeout(()=>ctrl.abort(), ms);
@@ -2493,7 +2544,7 @@ function addMsg(html, lado){
   const b = document.createElement('div');
   b.className = (lado==='user'
     ? 'bg-blue-600 text-white rounded-2xl px-4 py-3 max-w-[85%] shadow-sm prosa text-sm'
-    : 'bg-slate-800 border border-slate-700 text-slate-100 rounded-2xl px-4 py-3 max-w-[85%] shadow-sm prosa text-sm');
+    : 'msg-bot bg-slate-800 border border-slate-700 text-slate-100 rounded-2xl px-4 py-3 max-w-[85%] shadow-sm prosa text-sm');
   b.innerHTML = html; wrap.appendChild(b); chat.appendChild(wrap);
   chat.scrollTop = chat.scrollHeight; return b;
 }
@@ -2618,7 +2669,7 @@ async function enviar(){
     let d = {}; try { d = await r.json(); } catch(_){ d = {}; }
     if(!r.ok){ cargando.innerHTML = '<span class="text-amber-700">Error '+r.status+': '+esc(d.error||'fallo del servidor')+'</span>'; return; }
     if(d.error){ cargando.innerHTML = '<span class="text-amber-700">'+esc(d.error)+'</span>'; return; }
-    cargando.innerHTML = pintarRespuestaBot(d.respuesta, d.fuentes_normativas, d.fuentes_usadas);
+    cargando.innerHTML = pintarRespuestaBot(d.respuesta, d.fuentes_normativas, d.fuentes_usadas, d.sugerencias);
     if(userTxt) historial.push({rol:'user', texto:userTxt});
     historial.push({rol:'model', texto: d.respuesta || ''});
     if(historial.length > MAX_HIST_CLIENTE) historial = historial.slice(-MAX_HIST_CLIENTE);
@@ -2637,7 +2688,7 @@ async function enviar(){
 // =================== CONVERSACIONES (chat persistente por caso) ===================
 // Re-pinta una respuesta del modelo (badges [N] + "Fuentes citadas") con la MISMA logica
 // que usa enviar(): sirve para respuestas nuevas Y para re-pintar una conversacion guardada.
-function pintarRespuestaBot(respuesta, fragmentos, fuentesUsadas){
+function pintarRespuestaBot(respuesta, fragmentos, fuentesUsadas, sugerencias){
   _msgSeq++;
   const _frags = fragmentos || [];
   // Indexa las fuentes por su numero para resolver cada marcador (incl. los agrupados).
@@ -2647,10 +2698,15 @@ function pintarRespuestaBot(respuesta, fragmentos, fuentesUsadas){
     const cid = _msgSeq + '_' + fr.numero; _citas[cid] = fr; cidDe[fr.numero] = cid;
   });
   let h = esc(respuesta || 'Sin respuesta.');
-  // Marcadores sueltos "[2]" y AGRUPADOS "[2, 5, 6]": cada numero -> su propio badge clicable.
-  h = h.replace(/\[\s*\d+(?:\s*,\s*\d+)*\s*\]/g, grupo => {
-    const nums = grupo.match(/\d+/g) || [];
-    return nums.map(n => {
+  // Marcadores [2], AGRUPADOS "[2, 5, 6]" y CORRIDAS consecutivas "[1][2][2][2]": se aplanan en
+  // una sola corrida, se colapsan los numeros repetidos CONSECUTIVOS ([2][2]->[2]; [2,2,5]->[2,5];
+  // [1][2][2][2]->[1][2]) y cada numero restante -> su propio badge clicable. NO reordena ni
+  // remapea: solo elimina la repeticion visual consecutiva del mismo numero.
+  h = h.replace(/\[\s*\d+(?:\s*,\s*\d+)*\s*\](?:\s*\[\s*\d+(?:\s*,\s*\d+)*\s*\])*/g, corrida => {
+    const nums = corrida.match(/\d+/g) || [];
+    const unicos = [];
+    nums.forEach(n => { if(unicos[unicos.length-1] !== n) unicos.push(n); });   // dedup consecutivo
+    return unicos.map(n => {
       const cid = cidDe[n];
       return cid
         ? '<button type="button" class="cita-badge" data-cid="'+cid+'" title="Ver fuente">'+n+'</button>'
@@ -2658,12 +2714,22 @@ function pintarRespuestaBot(respuesta, fragmentos, fuentesUsadas){
     }).join(' ');
   });
   if(fuentesUsadas && fuentesUsadas.length){
-    h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes del caso usadas:</b> '
+    h += '<div class="fuentes-caso mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes del caso usadas:</b> '
        + fuentesUsadas.map(x=>esc(x.nombre)).join(', ') + '</div>';
   }
   if(_frags.length){
-    h += '<div class="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes citadas:</b><br>'
+    h += '<div class="fuentes-citadas mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-400"><b>Fuentes citadas:</b><br>'
        + _frags.map(s=>'<button type="button" data-cid="'+(_msgSeq+'_'+s.numero)+'" class="inline-flex items-center gap-1 bg-slate-700 border border-slate-600 text-slate-300 rounded px-1.5 py-0.5 mt-1 mr-1 hover:border-blue-500 transition"><span class="cita-badge">'+s.numero+'</span>'+esc(s.cita || s.documento)+'</button>').join('') + '</div>';
+  }
+  // Preguntas de PROFUNDIZACION (Mejora 3): chips clicables que reusan el flujo de envio.
+  // Solo se pintan en respuestas nuevas (enviar() pasa d.sugerencias); el re-pintado de
+  // historial no las recibe. Llevan la clase .preguntas-sugeridas para excluirlas de la copia.
+  if(sugerencias && sugerencias.length){
+    h += '<div class="preguntas-sugeridas mt-3 pt-2 border-t border-slate-700/60 text-[11px]">'
+       + '<div class="text-slate-500 mb-1">También puedes preguntar:</div>'
+       + '<div class="flex flex-col items-start gap-1">'
+       + sugerencias.map(s=>'<button type="button" class="sugerencia text-left text-blue-400 hover:text-blue-300 hover:underline">'+esc(s)+'</button>').join('')
+       + '</div></div>';
   }
   return h;
 }

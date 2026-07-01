@@ -24,6 +24,7 @@ Uso:
 """
 
 import re
+import json
 import time
 import random
 import argparse
@@ -958,7 +959,11 @@ INSTRUCCION_ESTRUCTURA = (
     "es competente, si la facultad es delegable o indelegable), nombralo de forma explicita.\n"
     "5. LIMITACIONES Y EXCEPCIONES NOMBRADAS: no las insinues ('con una excepcion', 'salvo "
     "ciertos casos'); nombra cual es la limitacion y cual la excepcion concretas.\n"
-    "6. CIERRE: indica la referencia normativa principal que sustenta la respuesta.\n"
+    "6. SIN BLOQUE FINAL DE REFERENCIAS: NO agregues al final de la respuesta un bloque de "
+    "'Referencias normativas', 'Referencias', 'Fuentes' ni una lista-resumen de los articulos o "
+    "normas citadas. El sistema ya muestra automaticamente debajo de la respuesta la lista de "
+    "'Fuentes citadas'. La respuesta termina en su contenido sustantivo (sin lista de cierre). "
+    "Esto NO afecta los marcadores [N] en linea tras cada afirmacion, que SI debes mantener.\n"
     "Ajusta la extension y la estructura a la complejidad de la consulta: no infles una respuesta "
     "simple con secciones o listas que no aporten. Si un detalle (p.ej. una causal) NO esta en el "
     "contexto recuperado, no lo inventes: responde con lo que el contexto contiene."
@@ -1106,6 +1111,80 @@ def generar_respuesta(pregunta, filas, *, modo="general", contexto_fuentes="",
     return {"respuesta": chequeo["respuesta_limpia"],
             "citas_validas": chequeo["citas_validas"],
             "citas_invalidas": chequeo["citas_invalidas"]}
+
+
+# ===================================================================
+# PREGUNTAS SUGERIDAS — llamada CORTA y AISLADA, posterior a la respuesta.
+# No toca la generacion principal, su prompt ni sus citas: solo propone temas
+# de profundizacion clicables. Resiliente: ante cualquier fallo devuelve [].
+# ===================================================================
+INSTRUCCION_SUGERENCIAS = (
+    "A partir de la consulta del usuario y de la respuesta dada, propon EXACTAMENTE 3 preguntas "
+    "de PROFUNDIZACION sobre el MISMO tema normativo, utiles para seguir explorando el marco legal "
+    "de contrataciones publicas. Requisitos de cada pregunta:\n"
+    "- Que profundice o amplie el tema tratado, sin repetir lo ya respondido.\n"
+    "- Que sea respondible con el MARCO NORMATIVO general (Ley 32069 y su Reglamento, directivas, "
+    "opiniones), NO sobre un documento u opinion especifica concreta.\n"
+    "- En español, clara, breve y autocontenida (que se entienda sin leer la respuesta).\n"
+    "Devuelve UNICAMENTE un arreglo JSON de 3 cadenas, sin texto adicional. "
+    'Ejemplo: ["¿...?", "¿...?", "¿...?"]'
+)
+
+
+def _parsear_sugerencias(texto, max_preguntas=3):
+    """Extrae hasta `max_preguntas` cadenas de la salida del modelo. Tolera cercos ```json ...```,
+    un arreglo JSON o, como ultimo recurso, lineas tipo lista. Devuelve [] si no hay nada usable."""
+    if not texto:
+        return []
+    t = re.sub(r'^```(?:json)?\s*|\s*```$', '', texto.strip(), flags=re.IGNORECASE)
+    preguntas = []
+    m = re.search(r'\[.*\]', t, flags=re.DOTALL)          # 1) intento JSON (arreglo de cadenas)
+    if m:
+        try:
+            datos = json.loads(m.group(0))
+            if isinstance(datos, list):
+                preguntas = [str(x).strip() for x in datos if str(x).strip()]
+        except Exception:
+            preguntas = []
+    if not preguntas:                                     # 2) fallback: lineas (sin vinetas/numeros)
+        for linea in t.splitlines():
+            linea = re.sub(r'^\s*(?:[-*•]|\d+[\.\)])\s*', '', linea).strip().strip('"')
+            if linea:
+                preguntas.append(linea)
+    vistas, salida = set(), []                            # dedup preservando orden + recorte
+    for p in preguntas:
+        clave = p.lower()
+        if clave not in vistas:
+            vistas.add(clave)
+            salida.append(p)
+        if len(salida) >= max_preguntas:
+            break
+    return salida
+
+
+def generar_preguntas_sugeridas(pregunta, respuesta, *, modelo=MODELO_GEN, max_preguntas=3):
+    """Propone hasta `max_preguntas` preguntas de profundizacion clicables a partir de la consulta
+    y de la respuesta YA generada. Llamada independiente (no contamina la respuesta ni sus citas).
+    Resiliente: ante cualquier fallo devuelve [] (nunca rompe el chat)."""
+    base = (respuesta or "").strip()
+    if not base:
+        return []
+    try:
+        prompt = (
+            INSTRUCCION_SUGERENCIAS + "\n\n"
+            f"CONSULTA DEL USUARIO:\n{(pregunta or '(analisis de fuentes)').strip()}\n\n"
+            f"RESPUESTA DADA:\n{base[:6000]}"
+        )
+        resp = con_reintentos(
+            lambda: cliente().models.generate_content(
+                model=modelo,
+                contents=[Content(role="user", parts=[Part(text=prompt)])],
+                config=GenerateContentConfig(temperature=0.4),
+            ),
+            etiqueta="sugerencias")
+        return _parsear_sugerencias(resp.text, max_preguntas)
+    except Exception:
+        return []
 
 
 def responder(pregunta, k=TOP_K, modelo=MODELO_GEN, temperatura=0.2):

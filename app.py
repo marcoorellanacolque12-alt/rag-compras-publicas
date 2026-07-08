@@ -45,15 +45,16 @@ import re
 import glob
 import uuid
 import json
+import unicodedata
 import sqlite3
 import zipfile
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from google.genai.types import GenerateContentConfig, Content, Part
@@ -431,6 +432,122 @@ def borrar_conversacion(conv_id):
             con.commit()
         finally:
             con.close()
+
+
+def obtener_conversacion(conv_id):
+    """Cabecera de una conversacion (id, caso_id, titulo, fechas) o None si no existe."""
+    con = _conn()
+    try:
+        r = con.execute("SELECT id, caso_id, titulo, fecha_creacion, fecha_actualizacion "
+                        "FROM conversaciones WHERE id=?", (conv_id,)).fetchone()
+    finally:
+        con.close()
+    return dict(r) if r else None
+
+
+# ================== EXPORTACION DE CONVERSACION A MARKDOWN ==================
+# Genera un .md legible de TODA la conversacion, CONSERVANDO los marcadores [N] en el
+# texto y adjuntando, al final de cada respuesta, el detalle de las fuentes citadas
+# (meta.fuentes_normativas) y las fuentes del caso usadas (meta.fuentes_usadas). Es la
+# contraparte del copiado limpio del frontend: aqui SI van los numeros y las fuentes.
+# Solo LEE de la BD (via leer_mensajes/obtener_conversacion); no modifica nada.
+
+_MESES_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+             "septiembre", "octubre", "noviembre", "diciembre"]
+_TZ_PERU = timezone(timedelta(hours=-5))   # America/Lima (sin horario de verano)
+
+
+def _fecha_legible(iso):
+    """ISO-8601 (UTC) -> 'DD de <mes> de AAAA, HH:MM (hora de Peru)'. Defensivo ante formatos raros."""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(_TZ_PERU)
+        return f"{dt.day:02d} de {_MESES_ES[dt.month - 1]} de {dt.year}, {dt:%H:%M} (hora de Perú)"
+    except Exception:
+        return iso or ""
+
+
+def _slug_archivo(texto, fallback="conversacion"):
+    """Nombre de archivo ASCII-safe a partir de un titulo (acentos->base, espacios->guiones)."""
+    base = unicodedata.normalize("NFKD", texto or "").encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^A-Za-z0-9]+", "-", base).strip("-").lower()
+    return (base or fallback)[:60]
+
+
+def _linea_fuente_citada(fr):
+    """Una entrada de fuentes_normativas -> item Markdown '[N] cita (titulo del articulo)'."""
+    numero = fr.get("numero")
+    etiqueta = fr.get("cita") or fr.get("documento") or "(fuente)"
+    titulo = (fr.get("articulo_titulo") or "").strip()
+    extra = f" — {titulo}" if titulo and titulo.lower() not in etiqueta.lower() else ""
+    return f"- **[{numero}]** {etiqueta}{extra}"
+
+
+def construir_markdown_conversacion(conv, mensajes):
+    """Arma el documento Markdown completo: encabezado + turnos (consulta/respuesta) con
+    los [N] intactos y el detalle de fuentes al final de cada respuesta."""
+    titulo = (conv.get("titulo") or "").strip() or "Conversación sin título"
+    lineas = [
+        f"# {titulo}",
+        "",
+        f"**Exportado:** {_fecha_legible(_ahora())}  ",
+        "**Registro de conversación** — Consulta al Asistente de Contrataciones Públicas. "
+        "Este documento es un registro de la conversación y no constituye asesoría legal formal.",
+        "",
+        "---",
+        "",
+    ]
+
+    if not mensajes:
+        lineas.append("_La conversación no tiene mensajes._")
+        lineas.append("")
+        return "\n".join(lineas)
+
+    # Recorre los mensajes agrupando cada 'user' con la(s) 'model' que le sigue(n). El esquema
+    # persiste siempre user->model en pares, pero se maneja de forma defensiva por si faltara uno.
+    n_consulta = 0
+    for m in mensajes:
+        rol = m.get("rol")
+        texto = (m.get("texto") or "").strip()
+        if rol == "user":
+            n_consulta += 1
+            lineas.append(f"## Consulta {n_consulta}")
+            lineas.append("")
+            lineas.append(f"**Consulta:** {texto or '_(Analizar las fuentes activas del caso)_'}")
+            lineas.append("")
+            continue
+
+        # Respuesta del asistente (rol 'model'): texto con [N] intactos + detalle de fuentes.
+        if n_consulta == 0:                    # respuesta huerfana sin consulta previa
+            n_consulta += 1
+            lineas.append(f"## Consulta {n_consulta}")
+            lineas.append("")
+        lineas.append("**Respuesta:**")
+        lineas.append("")
+        lineas.append(texto or "_(Sin respuesta.)_")
+        lineas.append("")
+
+        meta = m.get("meta") or {}
+        fnorm = meta.get("fuentes_normativas") or []
+        fusadas = meta.get("fuentes_usadas") or []
+        if fnorm:
+            lineas.append("**Fuentes citadas:**")
+            lineas.append("")
+            lineas.extend(_linea_fuente_citada(fr) for fr in fnorm)
+            lineas.append("")
+        if fusadas:
+            nombres = [str(fu.get("nombre") or "").strip() for fu in fusadas if fu.get("nombre")]
+            if nombres:
+                lineas.append("**Fuentes del caso usadas:**")
+                lineas.append("")
+                lineas.extend(f"- {nombre}" for nombre in nombres)
+                lineas.append("")
+        lineas.append("---")
+        lineas.append("")
+
+    return "\n".join(lineas)
 
 
 def borrar_caso(cid):
@@ -1087,6 +1204,23 @@ def api_leer_mensajes(conv_id: str):
     return leer_mensajes(conv_id)
 
 
+@app.get("/api/conversaciones/{conv_id}/export.md")
+def api_exportar_conversacion_md(conv_id: str):
+    """Descarga la conversacion completa en Markdown, con los [N] y el detalle de fuentes.
+    Solo lectura. 404 si la conversacion no existe; encabezado-solo si no tiene mensajes."""
+    conv = obtener_conversacion(conv_id)
+    if conv is None:
+        return JSONResponse(status_code=404, content={"error": "Conversación no encontrada."})
+    mensajes = leer_mensajes(conv_id)              # ya re-resuelve nombres/citas por id
+    md = construir_markdown_conversacion(conv, mensajes)
+    nombre = f"conversacion-{_slug_archivo(conv.get('titulo'))}.md"
+    return Response(
+        content=md,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
+
+
 @app.delete("/api/conversaciones/{conv_id}")
 def api_borrar_conversacion(conv_id: str):
     borrar_conversacion(conv_id)
@@ -1699,6 +1833,10 @@ HTML = r"""
                 class="inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed">
           🧹 Limpiar
         </button>
+        <button id="btnDescargar" onclick="descargarConversacion()" title="Descargar esta conversación en Markdown (con citas)"
+                class="inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed">
+          ⬇️ Descargar
+        </button>
         <button id="btnPanelNormativo" onclick="togglePanelNormativo()" title="Mostrar u ocultar el marco normativo"
                 class="hidden xl:inline-flex items-center gap-1.5 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-md px-3 py-1.5 transition">
           ⚖️ Marco normativo
@@ -2147,7 +2285,7 @@ async function borrarCaso(c){
 
 // =================== ENTRAR / SALIR DE UN CASO ===================
 function setChat(enabled){
-  ['q','btnChat','btnLimpiar'].forEach(id=>document.getElementById(id).disabled = !enabled);
+  ['q','btnChat','btnLimpiar','btnDescargar'].forEach(id=>document.getElementById(id).disabled = !enabled);
   document.getElementById('q').placeholder = enabled ? 'Escribe tu consulta...' : 'Entra a un caso para chatear...';
 }
 function resetChatUI(msg){
@@ -2538,6 +2676,38 @@ function limpiarChat(){
   resetChatUI(modoGeneral
     ? 'Consulta General reiniciada (modo estricto 🔒).'
     : 'Chat reiniciado para el caso <b>'+esc(casoActual.nombre)+'</b>.');
+}
+// Descarga la conversacion actual en Markdown (con los [N] y el detalle de fuentes). El
+// contenido lo arma el backend (GET .../export.md); aqui solo se dispara la descarga.
+async function descargarConversacion(){
+  if(!conversacionId){
+    alert('Aún no hay una conversación para descargar. Envía al menos una consulta.');
+    return;
+  }
+  const btn = document.getElementById('btnDescargar');
+  if(btn) btn.disabled = true;
+  try{
+    const r = await fetch('/api/conversaciones/'+conversacionId+'/export.md');
+    if(!r.ok){
+      alert('No se pudo generar la descarga (código '+r.status+').');
+      return;
+    }
+    // Nombre desde Content-Disposition (filename="..."); fallback si no viene.
+    let nombre = 'conversacion.md';
+    const cd = r.headers.get('Content-Disposition') || '';
+    const mt = cd.match(/filename="?([^"]+)"?/i);
+    if(mt) nombre = mt[1];
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = nombre;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }catch(e){
+    alert('Error al descargar la conversación: '+e);
+  }finally{
+    if(btn) btn.disabled = false;
+  }
 }
 function addMsg(html, lado){
   const wrap = document.createElement('div'); wrap.className = 'flex ' + (lado==='user'?'justify-end':'');

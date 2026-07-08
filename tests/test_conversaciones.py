@@ -154,5 +154,58 @@ class TestMigracionCasoIdNullable(unittest.TestCase):
             con.close()
 
 
+class TestExportMarkdown(unittest.TestCase):
+    """Export de conversacion a Markdown: conserva los [N] y adjunta el detalle de fuentes."""
+
+    def setUp(self):
+        fd, self.tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._orig = app.DB_PATH
+        app.DB_PATH = self.tmp
+        app._init_db()
+
+    def tearDown(self):
+        app.DB_PATH = self._orig
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.tmp + suf)
+            except OSError:
+                pass
+
+    def test_markdown_incluye_fuentes_y_marcadores(self):
+        caso = app.crear_caso("Caso export")
+        cid = caso["id"]
+        conv = app.crear_conversacion(cid, "¿el art. 64 aplica a obras?")
+        fnorm = [{"numero": 1, "documento": "Ley 32069", "cita": "Ley N° 32069, Art. 64",
+                  "articulo_titulo": "Adicionales de obra"}]
+        fusadas = [{"id": "f1", "nombre": "contrato-obra.pdf"}]
+        app.guardar_intercambio(conv, "¿es para obras?", "Sí, el Art. 64 [1] aplica a obras.",
+                                fnorm, fusadas)
+
+        md = app.construir_markdown_conversacion(app.obtener_conversacion(conv),
+                                                 app.leer_mensajes(conv))
+        # encabezado + nota legal
+        self.assertIn("# ¿el art. 64 aplica a obras?", md)
+        self.assertIn("no constituye asesoría legal formal", md)
+        # la pregunta y la respuesta CON el marcador [1] intacto
+        self.assertIn("**Consulta:** ¿es para obras?", md)
+        self.assertIn("Sí, el Art. 64 [1] aplica a obras.", md)
+        # detalle de fuentes citadas (numero + cita + titulo del articulo)
+        self.assertIn("**Fuentes citadas:**", md)
+        self.assertIn("**[1]** Ley N° 32069, Art. 64", md)
+        self.assertIn("Adicionales de obra", md)
+        # fuentes del caso usadas
+        self.assertIn("**Fuentes del caso usadas:**", md)
+        self.assertIn("contrato-obra.pdf", md)
+
+    def test_markdown_conversacion_vacia_solo_encabezado(self):
+        conv = app.crear_conversacion(None, "consulta general vacía")
+        md = app.construir_markdown_conversacion(app.obtener_conversacion(conv),
+                                                 app.leer_mensajes(conv))
+        self.assertIn("# consulta general vacía", md)
+        self.assertIn("no tiene mensajes", md)
+        self.assertNotIn("**Consulta:**", md)
+
+
 if __name__ == "__main__":
     unittest.main()
